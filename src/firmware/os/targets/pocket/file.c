@@ -218,7 +218,7 @@ void of_file_init(void) {
  * per PMA — but the bridge must own the CRAM0 mux before the Pocket
  * nonvolatile exit writeback reads the save window. */
 void of_check_shutdown(void) {
-    /* Same 1 kHz tick: deny save-state requests nobody will answer. */
+    /* Deny save-state requests nobody will answer (time-based inside). */
     of_savestate_tick();
 
     if (SYS_SHUTDOWN & SHUTDOWN_PENDING) {

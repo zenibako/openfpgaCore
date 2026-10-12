@@ -24,6 +24,18 @@
 // The order of operations above matches agg23's openFPGA-NES
 // save_state_controller.sv, a shipping Pocket core with sleep support.
 //
+// Wake: the Pocket reloads the bitstream and pushes the blob and its 0xA4
+// at once.  Measured on hardware, both are already there when the OS
+// starts -- long before a soft-CPU core has an app that could restore
+// anything.  So while no app has registered (cpu_size == 0, its reset
+// value) or the core is still in APF reset, a load is acknowledged and
+// reported ok at once -- the blob is already on its way into CRAM0, whose
+// bridge path depends on neither -- and load_req_tgl is left flipped, so
+// the OS finds the request pending when it boots and the app applies it
+// when it starts.  A save in that state is refused.  This block stays
+// alive through APF reset (por_n is its only reset); entering reset from a
+// running core (Reset Enter) clears any stale request and the counters.
+//
 // Bridge reads/writes inside the blob window are counted (rd_words,
 // wr_words) so firmware can tell when the host has finished pulling the
 // blob (and so keep CRAM0 on the bridge side until then) and whether a
@@ -38,7 +50,8 @@ module savestate_ctrl #(
     parameter [31:0] SS_MAX_SIZE    = 32'h0010_0000   // 1 MB blob window
 ) (
     input  wire        clk_74a,
-    input  wire        reset_n,
+    input  wire        por_n,           // power-on reset only (PLL lock)
+    input  wire        core_reset_n,    // APF reset (clk_74a domain)
 
     // core_bridge_cmd side
     input  wire        savestate_start,
@@ -93,6 +106,9 @@ wire [31:0] size_clamped = (size_s2 == 32'd0 || size_s2 > SS_MAX_SIZE)
                            ? SS_MAX_SIZE : {size_s2[31:2], 2'b00};
 assign savestate_size = size_clamped;
 
+// An app that can answer requests itself: out of reset and registered.
+wire app_ready = core_reset_n && (size_s2 != 32'd0);
+
 // CPU -> 74a toggles.  The err bits are written in the same store as the
 // toggle; they are sampled two cycles after the synchronized toggle edge,
 // by which time their own synchronizer has settled too.
@@ -107,13 +123,14 @@ reg start_done_d, load_done_d, clear_d;
 reg [1:0] start_done_pipe, load_done_pipe;
 reg start_prev, load_prev;
 reg bridge_rd_prev;
+reg core_reset_n_d;
 
 wire in_window = (bridge_addr[31:24] == SS_BRIDGE_ADDR[31:24]) &&
                  (bridge_addr[23:0]  >= SS_BRIDGE_ADDR[23:0])  &&
                  (bridge_addr[23:0]  <  SS_BRIDGE_ADDR[23:0] + SS_MAX_SIZE[23:0]);
 
-always @(posedge clk_74a or negedge reset_n) begin
-    if (!reset_n) begin
+always @(posedge clk_74a or negedge por_n) begin
+    if (!por_n) begin
         savestate_start_ack  <= 1'b0;
         savestate_start_busy <= 1'b0;
         savestate_start_ok   <= 1'b0;
@@ -134,7 +151,10 @@ always @(posedge clk_74a or negedge reset_n) begin
         clear_d              <= 1'b0;
         start_done_pipe      <= 2'b00;
         load_done_pipe       <= 2'b00;
+        core_reset_n_d       <= 1'b0;
     end else begin
+        core_reset_n_d <= core_reset_n;
+
         start_prev     <= savestate_start;
         load_prev      <= savestate_load;
         bridge_rd_prev <= bridge_rd;
@@ -154,7 +174,13 @@ always @(posedge clk_74a or negedge reset_n) begin
             savestate_start_err  <= 1'b0;
             savestate_load_ok    <= 1'b0;
             savestate_load_err   <= 1'b0;
-            start_req_tgl        <= ~start_req_tgl;
+            if (app_ready) begin
+                start_req_tgl    <= ~start_req_tgl;
+            end else begin
+                // Nobody to serialize anything: refuse.
+                savestate_start_busy <= 1'b0;
+                savestate_start_err  <= 1'b1;
+            end
             rd_words             <= 32'd0;
         end else if (!savestate_start) begin
             savestate_start_ack  <= 1'b0;
@@ -175,6 +201,11 @@ always @(posedge clk_74a or negedge reset_n) begin
             savestate_start_ok   <= 1'b0;
             savestate_start_err  <= 1'b0;
             load_req_tgl         <= ~load_req_tgl;
+            if (!app_ready) begin
+                // Wake: accepted now, restored once the app is up.
+                savestate_load_busy <= 1'b0;
+                savestate_load_ok   <= 1'b1;
+            end
         end else if (!savestate_load) begin
             savestate_load_ack   <= 1'b0;
         end
@@ -185,8 +216,26 @@ always @(posedge clk_74a or negedge reset_n) begin
             savestate_load_err   <=  load_err_s;
         end
 
+        // ---- Reset Enter from a running core: drop stale state ----
+        // (Placed before the counters so a blob pushed in reset still
+        // counts; requests arriving in the same cycle cannot happen, the
+        // bridge is busy with the 0x0010 command.)
+        if (core_reset_n_d && !core_reset_n) begin
+            savestate_start_busy <= 1'b0;
+            savestate_start_ok   <= 1'b0;
+            savestate_start_err  <= 1'b0;
+            savestate_load_busy  <= 1'b0;
+            savestate_load_ok    <= 1'b0;
+            savestate_load_err   <= 1'b0;
+            start_req_tgl        <= 1'b0;
+            load_req_tgl         <= 1'b0;
+        end
+
         // ---- Blob-window traffic counters ----
-        if (clear_s ^ clear_d) begin
+        if (core_reset_n_d && !core_reset_n) begin
+            rd_words <= 32'd0;
+            wr_words <= 32'd0;
+        end else if (clear_s ^ clear_d) begin
             rd_words <= 32'd0;
             wr_words <= 32'd0;
         end else begin

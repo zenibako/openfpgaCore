@@ -69,7 +69,90 @@ static void init() {
     tb->bridge_wr_data = 0; tb->cpu_start_done_tgl = 0; tb->cpu_start_err = 0;
     tb->cpu_load_done_tgl = 0; tb->cpu_load_err = 0; tb->cpu_clear_tgl = 0;
     tb->cpu_size = 0;
-    ticks(16);
+    tb->por_n = 0; ticks(4);
+    tb->por_n = 1; ticks(16);
+}
+
+/* Wake: the bitstream has just loaded and the core is still in APF reset
+ * (no Reset Exit yet) when the host pushes the blob and asks for a load. */
+static void test_wake_in_reset() {
+    std::printf("test_wake_in_reset:\n");
+    check_eq("core-in-reset-at-power-up", tb->core_reset_n, 0);
+    check_eq("save-in-reset-acked", host_cmd(0x00A0, 1) != 0xDEAD, 1);
+    check_eq("save-in-reset-refused", host_cmd(0x00A0, 0), 3);
+    check_eq("save-in-reset-no-request", tb->start_req_tgl, 0);
+    for (uint32_t i = 0; i < 5; i++) write32(BLOB + i * 4, 0xB10B0000u | i);
+    check_eq("blob-words-counted-in-reset", tb->wr_words, 5);
+    check_eq("load-in-reset-acked", host_cmd(0x00A4, 1) != 0xDEAD, 1);
+    check_eq("load-in-reset-reports-ok", host_cmd(0x00A4, 0), 2);
+    check_eq("load-left-pending-for-os", tb->load_req_tgl, 1);
+
+    check_eq("reset-exit", host_cmd(0x0011, 0), 0);
+    ticks(8);
+    check_eq("core-running", tb->core_reset_n, 1);
+    check_eq("pending-load-survives-reset-exit", tb->load_req_tgl, 1);
+    check_eq("blob-count-survives-reset-exit", tb->wr_words, 5);
+    /* The OS answers the pending load; the host already has its ok. */
+    cpu_complete_load(false);
+    tb->cpu_clear_tgl ^= 1; ticks(8);
+    check_eq("os-answer-keeps-request-level", tb->load_req_tgl, 1);
+    check_eq("os-clear-zeroes-count", tb->wr_words, 0);
+    check_eq("load-ok-still-reported-after-boot", host_cmd(0x00A4, 0), 2);
+
+    /* Warm-reset back to a clean, running core for the tests below. */
+    host_cmd(0x0010, 0); ticks(8);
+    host_cmd(0x0011, 0); ticks(8);
+}
+
+/* Wake with reset already released but the OS and app not up yet (no size
+ * registered): the load is answered at once and left pending. */
+static void test_wake_before_app() {
+    std::printf("test_wake_before_app:\n");
+    host_cmd(0x0010, 0); ticks(8);
+    host_cmd(0x0011, 0); ticks(8);
+    tb->cpu_size = 0; tb->cpu_clear_tgl = 0; tb->cpu_load_done_tgl = 0;
+    tb->cpu_start_done_tgl = 0; ticks(16);
+    host_cmd(0x0010, 0); ticks(8);        // settle any toggle edges
+    host_cmd(0x0011, 0); ticks(8);
+    check_eq("core-running-no-app", tb->core_reset_n, 1);
+    check_eq("save-before-app-refused", (host_cmd(0x00A0, 1), host_cmd(0x00A0, 0)), 3);
+    check_eq("save-before-app-no-request", tb->start_req_tgl, 0);
+    for (uint32_t i = 0; i < 7; i++) write32(BLOB + i * 4, 0xFEED0000u | i);
+    host_cmd(0x00A4, 1);
+    check_eq("load-before-app-ok-at-once", host_cmd(0x00A4, 0), 2);
+    check_eq("load-before-app-left-pending", tb->load_req_tgl, 1);
+    check_eq("load-before-app-blob-counted", tb->wr_words, 7);
+    /* App registers later; the pending request and count must hold. */
+    tb->cpu_size = 0x40020; ticks(16);
+    check_eq("pending-survives-app-register", tb->load_req_tgl, 1);
+    check_eq("count-survives-app-register", tb->wr_words, 7);
+    check_eq("ok-still-reported", host_cmd(0x00A4, 0), 2);
+    cpu_complete_load(false);
+    tb->cpu_clear_tgl ^= 1; ticks(8);
+    /* With an app registered, the next load waits for the CPU again. */
+    host_cmd(0x00A4, 1);
+    check_eq("load-with-app-is-busy", host_cmd(0x00A4, 0), 1);
+    cpu_complete_load(false);
+    check_eq("load-with-app-ok-after-cpu", host_cmd(0x00A4, 0), 2);
+    tb->cpu_size = 0x40000; ticks(8);
+}
+
+/* Reset Enter from a running core drops stale requests and counters, so
+ * the OS does not see a phantom load after a warm reset. */
+static void test_warm_reset() {
+    std::printf("test_warm_reset:\n");
+    write32(BLOB, 1);
+    host_cmd(0x00A4, 1);                  // left unanswered (busy)
+    check_eq("reset-enter", host_cmd(0x0010, 0), 0);
+    ticks(8);
+    check_eq("core-back-in-reset", tb->core_reset_n, 0);
+    check_eq("load-req-cleared", tb->load_req_tgl, 0);
+    check_eq("start-req-cleared", tb->start_req_tgl, 0);
+    check_eq("wr-words-cleared", tb->wr_words, 0);
+    check_eq("load-result-cleared", host_cmd(0x00A4, 0), 0);
+    check_eq("reset-exit-again", host_cmd(0x0011, 0), 0);
+    ticks(8);
+    check_eq("still-no-phantom-load", tb->load_req_tgl, 0);
 }
 
 static void test_query() {
@@ -141,9 +224,12 @@ int main(int argc, char **argv) {
     tb = new Vtb_savestate;
     std::printf("=== savestate_ctrl + core_bridge_cmd ===\n");
     init();
+    test_wake_in_reset();
     test_query();
     test_save();
     test_load();
+    test_wake_before_app();
+    test_warm_reset();
     std::printf("\n=== Results: %d passed, %d failed ===\n", passes, fails);
     delete tb;
     return fails == 0 ? 0 : 1;

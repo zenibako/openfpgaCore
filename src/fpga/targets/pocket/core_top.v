@@ -1957,7 +1957,8 @@ end
         .SS_MAX_SIZE    (32'h0010_0000)
     ) isavestate (
         .clk_74a                ( clk_74a ),
-        .reset_n                ( reset_n_apf ),
+        .por_n                  ( pll_ram_locked_74a ),
+        .core_reset_n           ( reset_n_apf ),
         .savestate_start        ( savestate_start ),
         .savestate_start_ack    ( savestate_start_ack ),
         .savestate_start_busy   ( savestate_start_busy ),

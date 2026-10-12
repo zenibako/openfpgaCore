@@ -22,8 +22,9 @@ int  of_savestate_save(const void *blob, uint32_t len);
 int  of_savestate_load(void *buf, uint32_t cap);
 void of_savestate_finish(int ok);
 
-/* Called from the 1 kHz kernel tick: denies requests that no app will
- * answer (save states never enabled, or a load nobody picks up). */
+/* Called from of_check_shutdown() -- the timer IRQ and every busy-wait
+ * spin, so at no fixed rate: denies requests that no app will answer (save
+ * states never enabled, or a load nobody picks up in time). */
 void of_savestate_tick(void);
 
 #endif /* OFOS_SAVESTATE_H */

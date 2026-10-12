@@ -65,7 +65,7 @@ static volatile int      ss_enabled;
 static volatile uint32_t ss_max_payload;
 static volatile int      ss_pending;
 static volatile uint32_t ss_seen;          /* last request toggles consumed */
-static volatile uint32_t ss_load_wait_ms;
+static volatile uint32_t ss_load_t0_ms;   /* of_timer_get_ms() when a load was seen */
 
 static inline uint32_t ss_irq_save(void) {
     uint32_t prev;
@@ -131,7 +131,7 @@ static void ss_sample(void) {
             ss_complete(SS_LOAD, 0);
     } else {
         ss_pending = SS_LOAD;
-        ss_load_wait_ms = 0;
+        ss_load_t0_ms = of_timer_get_ms();
     }
 }
 
@@ -156,7 +156,10 @@ void of_savestate_tick(void) {
         if (ss_pending == SS_SAVE) {
             ss_complete(SS_SAVE, 0);           /* no app support: deny now */
             ss_pending = SS_NONE;
-        } else if (++ss_load_wait_ms >= SS_LOAD_PICKUP_TIMEOUT_MS) {
+        } else if ((uint32_t)(of_timer_get_ms() - ss_load_t0_ms) >=
+                   SS_LOAD_PICKUP_TIMEOUT_MS) {
+            /* Wall-clock, not a call count: this runs from the timer IRQ
+             * AND from every spin of of_timer_delay_us(), far above 1 kHz. */
             ss_complete(SS_LOAD, 0);           /* wake, but no app took it */
             ss_pending = SS_NONE;
         }

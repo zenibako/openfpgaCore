@@ -29,10 +29,18 @@
  *       break;
  *   }
  *
- * Sleep is a save followed by power-off; wake reboots the core and issues a
- * load once the app is running, so call of_savestate_enable() early and poll
- * from the first frame.  Requests the app never answers are refused by the OS
- * (saves at once when save states are not enabled; loads after 30 s).
+ * Sleep is a save followed by power-off.  On wake the Pocket reloads the core
+ * and pushes the state back at once -- measured on hardware, the blob and the
+ * load request are already there when the OS starts, long before any app.
+ * The OS holds that request for the app, so call of_savestate_enable() early
+ * and poll from the first frame.  Requests the app never answers are refused
+ * by the OS (saves at once when save states are not enabled; loads after
+ * 30 s).
+ *
+ * The Pocket reads back the whole declared size on every save.  To keep
+ * saves short, declare the real size just for the hand-over:
+ * of_savestate_enable(n) before of_savestate_save(buf, n), then the maximum
+ * again afterwards.
  *
  * The core's core.json must also set "sleep_supported": true for the Pocket
  * to offer sleep.

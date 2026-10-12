@@ -10,6 +10,8 @@
 
 module tb_savestate (
     input  wire        clk,
+    input  wire        por_n,
+    output wire        core_reset_n,
 
     input  wire [31:0] bridge_addr,
     input  wire        bridge_rd,
@@ -31,6 +33,7 @@ module tb_savestate (
 );
 
 wire        reset_n;
+assign      core_reset_n = reset_n;
 wire        shutdown_pending;
 wire        osnotify_inmenu;
 wire        dataslot_requestread, dataslot_requestwrite, dataslot_update;
@@ -117,7 +120,8 @@ core_bridge_cmd dut (
 
 savestate_ctrl ss (
     .clk_74a               (clk),
-    .reset_n               (1'b1),
+    .por_n                 (por_n),
+    .core_reset_n          (reset_n),
     .savestate_start       (savestate_start),
     .savestate_start_ack   (savestate_start_ack),
     .savestate_start_busy  (savestate_start_busy),
