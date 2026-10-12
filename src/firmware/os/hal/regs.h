@@ -517,6 +517,27 @@
 #define   CRAM0_MODE_BRIDGE (0u << 0)   /* bridge drives CRAM0 controller (default) */
 #define   CRAM0_MODE_CPU    (1u << 0)   /* CPU's CDC drives CRAM0 controller */
 
+/* APF save states / sleep (HW_FEATURES bit 31, OF_HW_SAVESTATE).  The
+ * bitstream's savestate_ctrl acknowledges the host's 0x00A0 / 0x00A4
+ * commands and reports busy; firmware completes them here.  Blob window:
+ * CRAM0 offset 6 MB (bridge 0x20600000), 1 MB.  Registers read 0 on
+ * bitstreams without the feature. */
+#define SS_STATUS           REG32(0x4E000004u)  /* R: request toggles */
+#define   SS_STATUS_START_REQ   (1u << 0)   /* toggles on each host save request */
+#define   SS_STATUS_LOAD_REQ    (1u << 1)   /* toggles on each host load request */
+#define   SS_STATUS_IN_MENU     (1u << 2)   /* host OS menu open (0x00B0) */
+#define SS_CTRL             REG32(0x4E000004u)  /* W: complete / clear */
+#define   SS_CTRL_SAVE_DONE     (1u << 0)
+#define   SS_CTRL_LOAD_DONE     (1u << 1)
+#define   SS_CTRL_SAVE_ERR      (1u << 2)
+#define   SS_CTRL_LOAD_ERR      (1u << 3)
+#define   SS_CTRL_CLEAR_COUNTS  (1u << 4)
+#define SS_SIZE             REG32(0x4E000008u)  /* RW: blob bytes the host reads */
+#define SS_RD_WORDS         REG32(0x4E00000Cu)  /* R: host reads in window (quasi-static) */
+#define SS_WR_WORDS         REG32(0x4E000010u)  /* R: host writes in window (quasi-static) */
+#define SS_CRAM0_OFFSET     0x00600000u
+#define SS_WINDOW_SIZE      0x00100000u
+
 /* ======================================================================
  * Link Cable (0x4D000000)
  * ====================================================================== */

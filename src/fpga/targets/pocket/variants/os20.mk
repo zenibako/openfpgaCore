@@ -5,5 +5,5 @@
 # re-derives timers at boot.  CPU adds the 4/32 store buffer
 # (configs/os20.cfg).  The dual-issue wall needs ~11.2 ns, so 96 MHz
 # could never truly close; 90 MHz targets real closure margin.
-DEFS := INCLUDE_ANALOGIZER INCLUDE_HW_MIXER INCLUDE_TRANSLUC \
+DEFS := INCLUDE_ANALOGIZER INCLUDE_HW_MIXER INCLUDE_TRANSLUC INCLUDE_SAVESTATE \
         INCLUDE_PALETTE INCLUDE_4PLAYER INCLUDE_CLK90

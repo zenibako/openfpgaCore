@@ -107,7 +107,13 @@ module axi_periph_slave #(
     parameter INCLUDE_COMBINE = 1,
     // Param-span/tri Q29 dynamic-scale caps (bit 18, OF_HW_GPU_PARAM_SPAN_Q29_SCALE).
     // Tracks gpu_core's INCLUDE_PARAM_SPAN_Q29; os30/SM64 clears it (Q29 cone folded).
-    parameter INCLUDE_PARAM_SPAN_Q29 = 1
+    parameter INCLUDE_PARAM_SPAN_Q29 = 1,
+    // APF save states / sleep (HW_FEATURES bit 31, OF_HW_SAVESTATE).  Must
+    // track a savestate_ctrl instance in the target's core_top: the block
+    // answers bridge commands 0x00A0/0x00A4 and the OS completes them
+    // through the SS_* registers in the CRAM0 page (0x4E000004..0x10).
+    // Default 0: the registers read 0 and their logic folds away.
+    parameter INCLUDE_SAVESTATE = 0
 ) (
     input wire clk,
     input wire reset_n,
@@ -352,6 +358,21 @@ module axi_periph_slave #(
     // Shutdown handshake
     input wire         shutdown_pending,
     output reg         shutdown_ack,
+
+    // Save-state handshake with savestate_ctrl (clk_74a side).  Request
+    // toggles are synchronized here; the word counters are quasi-static
+    // (firmware reads them twice until two reads agree).  Targets without
+    // INCLUDE_SAVESTATE leave the inputs unconnected / tied 0.
+    input wire         ss_start_req_tgl,
+    input wire         ss_load_req_tgl,
+    input wire  [31:0] ss_rd_words,
+    input wire  [31:0] ss_wr_words,
+    output reg         ss_start_done_tgl,
+    output reg         ss_start_err,
+    output reg         ss_load_done_tgl,
+    output reg         ss_load_err,
+    output reg         ss_clear_tgl,
+    output reg  [31:0] ss_size,
 
     // Hardware timer interrupt
     output wire        timer_irq,
@@ -795,7 +816,8 @@ localparam [31:0] FEAT_LINK = 32'h0000_0000;
 localparam [31:0] HW_CONTRACT_REV = 32'd2;
 
 localparam [31:0] HW_FEATURES_RESOLVED =
-    32'h0000_0001      // bit 0  OF_HW_MIXER: a 32-voice mixer is available (SET on
+    ((INCLUDE_SAVESTATE != 0) ? 32'h8000_0000 : 32'h0000_0000) // bit 31 OF_HW_SAVESTATE
+    | 32'h0000_0001      // bit 0  OF_HW_MIXER: a 32-voice mixer is available (SET on
                        //        every target; SW-backed when bit 1 is clear)
     | 32'h0000_0010    // GPU span renderer
     | 32'h0003_E000    // GPU persp + fragpipe + param span/list/z caps (bits 13..17)
@@ -1973,10 +1995,31 @@ wire [31:0] uart_rdata = (req_addr[3:2] == 2'b00) ?
 wire [31:0] audio_rdata = (req_addr[4:2] == 3'd0) ? {21'b0, audio_fifo_full, audio_fifo_level} :
                           32'h0;
 
-/* CRAM0 ownership mode read decode:
- *   0x00: {31'b0, cram0_mode} — current owner (0=bridge, 1=CPU). */
-wire [31:0] cram0_mode_rdata = (req_addr[3:2] == 2'd0) ? {31'b0, cram0_mode} :
-                               32'h0;
+/* CRAM0 page read decode:
+ *   0x00: {31'b0, cram0_mode} — current owner (0=bridge, 1=CPU).
+ *   Save-state registers (INCLUDE_SAVESTATE; read 0 otherwise):
+ *   0x04: SS_STATUS {22'b0, load_done_tgl, start_done_tgl, 5'b0,
+ *                    os_inmenu, load_req_tgl, start_req_tgl}
+ *   0x08: SS_SIZE   blob size in bytes the host reads on save (0 = max)
+ *   0x0C: SS_RD_WORDS  host bridge reads in the blob window since the
+ *                      last save request (quasi-static: read until equal)
+ *   0x10: SS_WR_WORDS  host bridge writes in the blob window since the
+ *                      last SS_CTRL clear (quasi-static: read until equal) */
+reg [2:0] ss_start_req_sync, ss_load_req_sync;
+always @(posedge clk) begin
+    ss_start_req_sync <= {ss_start_req_sync[1:0], ss_start_req_tgl};
+    ss_load_req_sync  <= {ss_load_req_sync[1:0],  ss_load_req_tgl};
+end
+wire [31:0] ss_status_rdata = {22'b0, ss_load_done_tgl, ss_start_done_tgl, 5'b0,
+                               os_inmenu_s, ss_load_req_sync[2], ss_start_req_sync[2]};
+wire [31:0] cram0_mode_rdata =
+      (req_addr[4:2] == 3'd0) ? {31'b0, cram0_mode}
+    : (INCLUDE_SAVESTATE == 0) ? 32'h0
+    : (req_addr[4:2] == 3'd1) ? ss_status_rdata
+    : (req_addr[4:2] == 3'd2) ? ss_size
+    : (req_addr[4:2] == 3'd3) ? ss_rd_words
+    : (req_addr[4:2] == 3'd4) ? ss_wr_words
+    :                           32'h0;
 
 /* Mixer (0x4B) read decode.  The read mux fans in
  *   - control regs (group/master/voice_group/ctrl/irq)
@@ -2205,6 +2248,12 @@ always @(posedge clk or posedge reset) begin
 
         sysreg_wr_fire <= 0;
         cram0_mode <= 1'b0;     // bridge owns CRAM0 at reset
+        ss_start_done_tgl <= 1'b0;
+        ss_start_err      <= 1'b0;
+        ss_load_done_tgl  <= 1'b0;
+        ss_load_err       <= 1'b0;
+        ss_clear_tgl      <= 1'b0;
+        ss_size           <= 32'd0;
         uart_tx_fifo_we  <= 0;
         uart_tx_fifo_din <= 0;
         link_reg_wr <= 0;
@@ -2434,8 +2483,28 @@ always @(posedge clk or posedge reset) begin
                         audio_sample_wr   <= 1'b1;
                         audio_sample_data <= req_wdata;
                     end
-                    if (req_is_cram0 && req_addr[3:2] == 2'd0)
+                    if (req_is_cram0 && req_addr[4:2] == 3'd0)
                         cram0_mode <= req_wdata[0];
+                    /* SS_CTRL (0x4E000004), INCLUDE_SAVESTATE only:
+                     *   bit0 complete the pending save (bit2 = error)
+                     *   bit1 complete the pending load (bit3 = error)
+                     *   bit4 zero the blob-window word counters
+                     * The err bit is latched with its toggle; savestate_ctrl
+                     * samples it after the synchronized toggle edge. */
+                    if ((INCLUDE_SAVESTATE != 0) && req_is_cram0 && req_addr[4:2] == 3'd1) begin
+                        if (req_wdata[0]) begin
+                            ss_start_err      <= req_wdata[2];
+                            ss_start_done_tgl <= ~ss_start_done_tgl;
+                        end
+                        if (req_wdata[1]) begin
+                            ss_load_err       <= req_wdata[3];
+                            ss_load_done_tgl  <= ~ss_load_done_tgl;
+                        end
+                        if (req_wdata[4])
+                            ss_clear_tgl      <= ~ss_clear_tgl;
+                    end
+                    if ((INCLUDE_SAVESTATE != 0) && req_is_cram0 && req_addr[4:2] == 3'd2)
+                        ss_size <= req_wdata;
                     if (req_is_link) begin
                         link_reg_wr    <= 1'b1;
                         link_reg_addr  <= req_addr[6:2];

@@ -26,6 +26,7 @@
 #include "../hal/hal.h"
 #include "../hal/regs.h"
 #include "../hal/file.h"
+#include "../hal/savestate.h"
 
 /* ======================================================================
  * Wrappers for SDK/HAL signature mismatches
@@ -281,6 +282,13 @@ void services_table_init(void) {
 
     /* Dock state */
     svc->input_is_docked = of_input_is_docked;
+
+    /* Save states / sleep */
+    svc->savestate_enable = of_savestate_enable;
+    svc->savestate_poll   = of_savestate_poll;
+    svc->savestate_save   = of_savestate_save;
+    svc->savestate_load   = of_savestate_load;
+    svc->savestate_finish = of_savestate_finish;
 }
 
 void services_table_set_smp_bank(const void *base, uint32_t size) {

@@ -152,6 +152,7 @@ TARGET_SRCS = $(TARGET_DIR)/video.c \
               $(TARGET_DIR)/audio.c \
               $(TARGET_DIR)/input.c \
               $(TARGET_DIR)/save.c \
+              $(TARGET_DIR)/savestate.c \
               $(TARGET_DIR)/file.c \
               $(TARGET_DIR)/analogizer.c \
               $(TARGET_DIR)/terminal.c \

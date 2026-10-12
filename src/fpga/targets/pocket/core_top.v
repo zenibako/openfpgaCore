@@ -787,10 +787,19 @@ wire        bridge_wr_issue = !cram0_mode_74a &&
                               !bridge_wr_fifo_empty &&
                               !bridge_wr_inflight &&
                               !ctrl_word_busy;
-wire        bridge_wr_accept = !cram0_mode_74a &&
+// Save-state blob writes (CRAM0 6 MB+, INCLUDE_SAVESTATE) arrive whenever the
+// host chooses, not inside a firmware-requested transfer, so they are queued
+// even while the CPU owns CRAM0; the FIFO drains once firmware hands CRAM0
+// back.  Everything else keeps the old "drop while CPU-owned" behaviour.
+`ifdef INCLUDE_SAVESTATE
+wire        bridge_ss_window = (bridge_addr[23:20] >= 4'h6) && (bridge_addr[23:20] < 4'h7);
+`else
+wire        bridge_ss_window = 1'b0;
+`endif
+wire        bridge_wr_accept = (!cram0_mode_74a || bridge_ss_window) &&
                                bridge_cram0_wr_pulse &&
                                (!bridge_wr_fifo_full || bridge_wr_issue);
-wire        bridge_wr_overrun_pulse = !cram0_mode_74a &&
+wire        bridge_wr_overrun_pulse = (!cram0_mode_74a || bridge_ss_window) &&
                                       bridge_cram0_wr_pulse &&
                                       bridge_wr_fifo_full &&
                                       !bridge_wr_issue;
@@ -1926,6 +1935,78 @@ end
     wire            savestate_load_ok;
     wire            savestate_load_err;
 
+    // Save-state CPU handshake (savestate_ctrl <-> axi_periph_slave).
+    wire            ss_start_req_tgl;
+    wire            ss_load_req_tgl;
+    wire    [31:0]  ss_rd_words;
+    wire    [31:0]  ss_wr_words;
+    wire            ss_start_done_tgl_cpu;
+    wire            ss_start_err_cpu;
+    wire            ss_load_done_tgl_cpu;
+    wire            ss_load_err_cpu;
+    wire            ss_clear_tgl_cpu;
+    wire    [31:0]  ss_size_cpu;
+
+`ifdef INCLUDE_SAVESTATE
+    // APF save states + sleep/wake.  The blob lives in CRAM0 at bridge
+    // address 0x20600000 (CRAM0 offset 6 MB, above the app DMA pool), so the
+    // existing bridge <-> CRAM0 path carries it both ways.  See
+    // savestate_ctrl.v for the protocol.
+    savestate_ctrl #(
+        .SS_BRIDGE_ADDR (32'h2060_0000),
+        .SS_MAX_SIZE    (32'h0010_0000)
+    ) isavestate (
+        .clk_74a                ( clk_74a ),
+        .reset_n                ( reset_n_apf ),
+        .savestate_start        ( savestate_start ),
+        .savestate_start_ack    ( savestate_start_ack ),
+        .savestate_start_busy   ( savestate_start_busy ),
+        .savestate_start_ok     ( savestate_start_ok ),
+        .savestate_start_err    ( savestate_start_err ),
+        .savestate_load         ( savestate_load ),
+        .savestate_load_ack     ( savestate_load_ack ),
+        .savestate_load_busy    ( savestate_load_busy ),
+        .savestate_load_ok      ( savestate_load_ok ),
+        .savestate_load_err     ( savestate_load_err ),
+        .savestate_supported    ( savestate_supported ),
+        .savestate_addr         ( savestate_addr ),
+        .savestate_size         ( savestate_size ),
+        .savestate_maxloadsize  ( savestate_maxloadsize ),
+        .bridge_addr            ( bridge_addr ),
+        .bridge_rd              ( bridge_rd ),
+        .bridge_wr              ( bridge_wr ),
+        .cpu_start_done_tgl     ( ss_start_done_tgl_cpu ),
+        .cpu_start_err          ( ss_start_err_cpu ),
+        .cpu_load_done_tgl      ( ss_load_done_tgl_cpu ),
+        .cpu_load_err           ( ss_load_err_cpu ),
+        .cpu_clear_tgl          ( ss_clear_tgl_cpu ),
+        .cpu_size               ( ss_size_cpu ),
+        .start_req_tgl          ( ss_start_req_tgl ),
+        .load_req_tgl           ( ss_load_req_tgl ),
+        .rd_words               ( ss_rd_words ),
+        .wr_words               ( ss_wr_words )
+    );
+`else
+    // No save-state support: report "unsupported" to the host (the values
+    // these wires had when they were left undriven).
+    assign savestate_supported   = 1'b0;
+    assign savestate_addr        = 32'd0;
+    assign savestate_size        = 32'd0;
+    assign savestate_maxloadsize = 32'd0;
+    assign savestate_start_ack   = 1'b0;
+    assign savestate_start_busy  = 1'b0;
+    assign savestate_start_ok    = 1'b0;
+    assign savestate_start_err   = 1'b0;
+    assign savestate_load_ack    = 1'b0;
+    assign savestate_load_busy   = 1'b0;
+    assign savestate_load_ok     = 1'b0;
+    assign savestate_load_err    = 1'b0;
+    assign ss_start_req_tgl      = 1'b0;
+    assign ss_load_req_tgl       = 1'b0;
+    assign ss_rd_words           = 32'd0;
+    assign ss_wr_words           = 32'd0;
+`endif
+
     wire            osnotify_inmenu;
 
     // CPU-side signals (in clk_ram_controller domain)
@@ -2044,7 +2125,8 @@ always @(posedge clk_74a) begin
         // SDRAM-leg counter removed with bridge_to_sdram; brg_wcnt_sdram stays 0.
         // F6 sticky: a CRAM0-range bridge write while cram0_mode_74a=1
         // (CPU owns the mux) is dropped by the bridge_wr_accept gate.
-        if (bridge_cram0_wr_pulse && cram0_mode_74a)
+        // Save-state window writes are queued, not dropped (see above).
+        if (bridge_cram0_wr_pulse && cram0_mode_74a && !bridge_ss_window)
             brg_cram0_drop_cpu_owned <= 1'b1;
         if (bridge_wr_overrun_pulse)
             brg_cram0_drop_overrun <= 1'b1;
@@ -2598,6 +2680,9 @@ assign video_hs = vidout_hs;
         .INCLUDE_PARAM_TRI(`ifdef INCLUDE_PARAM_TRI 1 `else 0 `endif),
         .INCLUDE_VERT_TRI(`ifdef INCLUDE_VERT_TRI 1 `else 0 `endif),
         .INCLUDE_PARAM_TRI_RECS(`ifdef INCLUDE_PARAM_TRI_RECS 1 `else 0 `endif),
+        // Save states / sleep (HW_FEATURES bit 31) — tracks the
+        // savestate_ctrl instance above.
+        .INCLUDE_SAVESTATE(`ifdef INCLUDE_SAVESTATE 1 `else 0 `endif),
         .INCLUDE_COLUMN_LIST(`ifdef INCLUDE_COLUMN_LIST 1 `else 0 `endif),
         .INCLUDE_COMPACT_SPAN(`ifdef INCLUDE_COMPACT_SPAN 1 `else 0 `endif),
         // Fast texture memory advertisement (HW_FEATURES bit 25).  The CRAM1
@@ -2784,6 +2869,17 @@ assign video_hs = vidout_hs;
         // Shutdown handshake
         .shutdown_pending(shutdown_pending_cpu),
         .shutdown_ack(shutdown_ack_cpu),
+        // Save-state handshake (savestate_ctrl)
+        .ss_start_req_tgl(ss_start_req_tgl),
+        .ss_load_req_tgl(ss_load_req_tgl),
+        .ss_rd_words(ss_rd_words),
+        .ss_wr_words(ss_wr_words),
+        .ss_start_done_tgl(ss_start_done_tgl_cpu),
+        .ss_start_err(ss_start_err_cpu),
+        .ss_load_done_tgl(ss_load_done_tgl_cpu),
+        .ss_load_err(ss_load_err_cpu),
+        .ss_clear_tgl(ss_clear_tgl_cpu),
+        .ss_size(ss_size_cpu),
         .timer_irq(timer_irq),
         .uart_rx_irq(),
         .link_irq(link_irq),

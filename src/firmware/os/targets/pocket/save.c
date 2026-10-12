@@ -200,6 +200,10 @@ void of_save_begin_cpu(void) {
     cram0_acquire_cpu();
 }
 
+int of_save_cpu_held(void) {
+    return cram0_cpu_hold_count != 0;
+}
+
 void of_save_end_cpu(void) {
     if (cram0_cpu_hold_count == 0) {
         cram0_release_to_bridge();

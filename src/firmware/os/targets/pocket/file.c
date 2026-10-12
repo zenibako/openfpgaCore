@@ -16,6 +16,7 @@
 #include "cache.h"
 #include "regs.h"
 #include "save.h"
+#include "savestate.h"
 #include "terminal.h"
 #include <string.h>
 
@@ -217,6 +218,9 @@ void of_file_init(void) {
  * per PMA — but the bridge must own the CRAM0 mux before the Pocket
  * nonvolatile exit writeback reads the save window. */
 void of_check_shutdown(void) {
+    /* Same 1 kHz tick: deny save-state requests nobody will answer. */
+    of_savestate_tick();
+
     if (SYS_SHUTDOWN & SHUTDOWN_PENDING) {
         /* Security wipe: scrub the non-save CRAM0 regions (stale boot copy of
          * os.bin, DMA scratch, app file-staging pool) so transient loaded data
@@ -1331,4 +1335,10 @@ void of_file_async_tick(void) {
 
 int of_file_async_busy(void) {
     return async_state.active;
+}
+
+/* No async transfer in flight and no deferred bounce copy pending: nothing
+ * will touch CRAM0 until the next file call. */
+int of_file_cram0_quiet(void) {
+    return !async_state.active && !async_state.copy_pending;
 }

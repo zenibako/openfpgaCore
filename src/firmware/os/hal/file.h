@@ -201,6 +201,10 @@ int of_file_async_poll(void);
 /* Check if an async read is currently in flight. */
 int of_file_async_busy(void);
 
+/* Nonzero when no async transfer or deferred bounce copy is pending
+ * (Pocket; other targets do not implement it). */
+int of_file_cram0_quiet(void);
+
 /* App-visible CRAM0 staging memory for async file reads.  This prevents apps
  * from hardcoding CRAM0 addresses while keeping the bridge DMA target in the
  * region the hardware supports. */
