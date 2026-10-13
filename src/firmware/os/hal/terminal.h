@@ -39,8 +39,8 @@ void of_term_init(void);
 void of_term_putchar(char c);
 
 /* While quiet, of_term_putchar/puts/printf draw nothing (the resume boot
- * screen shows one line and no status chatter).  Pocket only; a no-op
- * elsewhere. */
+ * screen shows one line and no status chatter).  Defined once in
+ * targets/pocket/terminal.c, which the mister and sim shims include. */
 void of_term_set_quiet(int on);
 
 /* Print a null-terminated string */

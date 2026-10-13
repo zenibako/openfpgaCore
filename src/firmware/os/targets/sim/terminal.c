@@ -6,5 +6,3 @@
 
 /* sim target HAL shim — see targets/sim/target_platform.h */
 #include "../pocket/terminal.c"
-
-void of_term_set_quiet(int on) { (void)on; }
