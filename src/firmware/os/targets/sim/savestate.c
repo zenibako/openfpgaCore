@@ -14,3 +14,4 @@ int  of_savestate_save(const void *blob, uint32_t len) { (void)blob; (void)len; 
 int  of_savestate_load(void *buf, uint32_t cap) { (void)buf; (void)cap; return OF_ERR_NOT_SUPPORTED; }
 void of_savestate_finish(int ok) { (void)ok; }
 void of_savestate_tick(void) {}
+int  of_savestate_boot_pending(void) { return 0; }

@@ -27,4 +27,9 @@ void of_savestate_finish(int ok);
  * states never enabled, or a load nobody picks up in time). */
 void of_savestate_tick(void);
 
+/* Nonzero when the host had already asked for a state load before the OS
+ * started (wake from sleep / Memory opened from the Pocket menu).  Valid
+ * once the hardware contract has been checked; 0 on targets without it. */
+int  of_savestate_boot_pending(void);
+
 #endif /* OFOS_SAVESTATE_H */

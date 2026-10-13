@@ -146,6 +146,10 @@ static int ss_cram0_parkable(void) {
     return !of_save_cpu_held() && of_file_cram0_quiet() && !of_file_async_busy();
 }
 
+int of_savestate_boot_pending(void) {
+    return ss_present() && (SS_STATUS & SS_STATUS_LOAD_REQ) != 0;
+}
+
 void of_savestate_tick(void) {
     if (!ss_present())
         return;

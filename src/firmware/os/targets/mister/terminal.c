@@ -8,3 +8,5 @@
  * same scanout/mixer RTL) — include the canonical implementation like the
  * sim target does, so fixes propagate instead of silently diverging. */
 #include "../pocket/terminal.c"
+
+void of_term_set_quiet(int on) { (void)on; }
