@@ -32,6 +32,8 @@ def main():
 static volatile uint32_t SS_SIZE, SS_RD_WORDS, CRAM0_MODE;
 static uint32_t window[32];
 #define SS_BLOB window
+#define SS_WINDOW_SIZE ((uint32_t)sizeof(window))
+static uint32_t declared_size = 40;   /* header + one padded payload word pair */
 static int ss_pending;
 static uint32_t ss_max_payload;
 static uint32_t clock_ms, origin, read_delay, delivered_words, elapsed;
@@ -124,7 +126,7 @@ static void run(uint32_t start, uint32_t delay, uint32_t words, int expected, in
     const uint8_t payload[7] = {1,2,3,4,5,6,7};
     memset(window, 0xcc, sizeof(window));
     ss_pending = SS_SAVE; ss_max_payload = 7;
-    SS_SIZE = 40; SS_RD_WORDS = 0;
+    SS_SIZE = declared_size; SS_RD_WORDS = 0;
     origin = clock_ms = start; elapsed = 0;
     read_delay = delay; delivered_words = words;
     completions = 0; initial_hold = hold_count = held;
@@ -135,6 +137,11 @@ static void run(uint32_t start, uint32_t delay, uint32_t words, int expected, in
     assert(CRAM0_MODE == (held ? CRAM0_MODE_CPU : CRAM0_MODE_BRIDGE));
     assert(memcmp((uint8_t *)window + SS_HEADER_BYTES, payload, sizeof(payload)) == 0);
     assert(window[4] == crc32_buf(payload, sizeof(payload)));
+    /* The host reads SS_SIZE bytes: everything after the payload up to
+     * there is zeroed, and nothing beyond it is touched. */
+    assert(((uint8_t *)window)[SS_HEADER_BYTES + sizeof(payload)] == 0);
+    for (uint32_t w = 10; w < declared_size / 4u; w++) assert(window[w] == 0);
+    for (uint32_t w = declared_size / 4u; w < 32; w++) assert(window[w] == 0xccccccccu);
     if (expected == OF_ERR_TIMEOUT) assert(elapsed >= SS_HOST_READ_TIMEOUT_MS);
     else assert(elapsed < SS_HOST_READ_TIMEOUT_MS);
     /* An app reporting the returned error must not emit another toggle. */
@@ -149,6 +156,10 @@ int main(void) {
     run(UINT32_MAX - 2500u, 3000, 10, 0, 1); /* success across timer wrap */
     run(UINT32_MAX - 2500u, 3000, 0, OF_ERR_TIMEOUT, 1);
     run(UINT32_MAX - 2500u, 3000, 9, OF_ERR_TIMEOUT, 0);
+    declared_size = 56;                 /* a declared maximum above the payload */
+    run(0, 3000, 14, 0, 0);             /* the zeroed tail is part of the read */
+    run(0, 3000, 13, OF_ERR_TIMEOUT, 0);
+    declared_size = 40;
     puts("PASS: actual save complete/partial/zero, timer wrap, ownership, one toggle");
 }
 '''

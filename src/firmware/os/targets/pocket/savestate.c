@@ -300,6 +300,16 @@ int of_savestate_save(const void *blob, uint32_t len) {
     fence();
     ss_write_words(0, (const uint8_t *)&h, sizeof(h));
     ss_write_words(SS_HEADER_BYTES / 4u, (const uint8_t *)blob, len);
+    /* The host reads SS_SIZE bytes whatever the payload length: zero the
+     * rest so a state file never carries an earlier state's tail. */
+    {
+        uint32_t used = (SS_HEADER_BYTES + len + 3u) / 4u;
+        uint32_t end = SS_SIZE / 4u;
+        if (end > SS_WINDOW_SIZE / 4u)
+            end = SS_WINDOW_SIZE / 4u;
+        for (uint32_t w = used; w < end; w++)
+            SS_BLOB[w] = 0;
+    }
     fence();
     of_save_end_cpu();
 
@@ -338,6 +348,10 @@ int of_savestate_load(void *buf, uint32_t cap) {
         return OF_ERR_NOT_SUPPORTED;
     if (ss_pending != SS_LOAD)
         return OF_ERR_INVALID_STATE;
+    if (!buf) {
+        of_savestate_finish(0);
+        return OF_ERR_INVALID_PARAM;
+    }
 
     ss_quiesce_files();
 
@@ -347,6 +361,12 @@ int of_savestate_load(void *buf, uint32_t cap) {
     uint32_t t0 = of_timer_get_ms();
     while (!(DS_STATUS & DS_STATUS_WR_IDLE) &&
            (uint32_t)(of_timer_get_ms() - t0) < SS_DRAIN_TIMEOUT_MS) {}
+    if (!(DS_STATUS & DS_STATUS_WR_IDLE)) {
+        /* Still draining: the window may be incomplete, and taking CRAM0
+         * now would strand the queued words.  Fail rather than read it. */
+        of_savestate_finish(0);
+        return OF_ERR_IO;
+    }
 
     uint32_t got_words = ss_read_stable(&SS_WR_WORDS);
     ss_header_t h;
