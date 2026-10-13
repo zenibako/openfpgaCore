@@ -336,6 +336,11 @@ struct of_services_table {
     int       (*savestate_save)(const void *blob, uint32_t len);
     int       (*savestate_load)(void *buf, uint32_t cap);
     void      (*savestate_finish)(int ok);
+
+    /* -- Heap capacity query (append-only) --
+     * Read-only sufficient condition for a fresh mmap carve, including a
+     * tracking slot. Zero means unknown; it is not allocation failure. */
+    int       (*heap_can_reserve)(uint32_t bytes);
 };
 
 #ifndef OF_PC

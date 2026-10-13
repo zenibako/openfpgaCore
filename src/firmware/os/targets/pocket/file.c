@@ -64,6 +64,7 @@ static struct {
     volatile uint32_t copy_off;       /* bounce copy progress in bytes     */
     int               copy_result;
     volatile uint32_t age_ms;         /* 1 kHz ticks with no DONE (watchdog) */
+    volatile int      quarantined;    /* logically failed DMA, host still owns it */
 } async_state;
 
 /* Local IRQ mask save/restore for tick-vs-app-context critical sections
@@ -191,6 +192,7 @@ void of_file_init(void) {
     async_state.bounce_to_dest = 0;
     async_state.callback = (void *)0;
     async_token_counter = 0;
+    async_state.quarantined = 0;
     dma_stage_next = 0;
 
 #if OF_TARGET_PLATFORM_ID == OF_PLATFORM_SIM
@@ -360,7 +362,30 @@ static int ds_issue_command(uint32_t cmd) {
  * uncopied async read. */
 static void async_copy_drain(void);
 
+/* A logical timeout cannot cancel an APF command. READY/WR_IDLE alone can
+ * already be high before its host ACK: require its latched DONE as well.
+ * No new file command may reset that latch or reuse its staging window until
+ * all old writes have drained. Clear the old IRQ before publishing reuse. */
+static int async_quarantine_gate(void) {
+    uint32_t irq = file_irq_save();
+    if (async_state.quarantined) {
+        uint32_t st = DS_STATUS;
+        uint32_t finished = DS_STATUS_DONE | DS_STATUS_READY | DS_STATUS_WR_IDLE;
+        if ((st & finished) != finished) {
+            file_irq_restore(irq);
+            return OF_ERR_BUSY;
+        }
+        IRQ_MASK &= ~IRQ_MASK_DATASLOT;
+        DS_STATUS = DS_STATUS_IRQ_PENDING;
+        async_state.quarantined = 0;
+    }
+    file_irq_restore(irq);
+    return 0;
+}
+
 static int async_gate(void) {
+    if (async_quarantine_gate())
+        return OF_ERR_BUSY;
     if (async_state.copy_pending) {
         async_copy_drain();
         return 0;
@@ -1155,7 +1180,7 @@ int of_file_read_async(uint32_t slot_id, uint32_t slot_offset,
      * completion inline so back-to-back streaming can't wedge on it. */
     if (async_state.copy_pending)
         async_copy_drain();
-    if (async_state.active)
+    if (async_gate())
         return OF_ERR_BUSY;
     if (length > OF_TARGET_CRAM0_DMA_CHUNK_SIZE)
         return OF_ERR_BAD_RANGE;
@@ -1241,6 +1266,21 @@ void of_file_async_irq_service(void) {
     async_complete(st);
 }
 
+/* Caller holds the IRQ guard and has checked completion first. While active,
+ * savestate_poll cannot park CRAM0 (the file HAL is not quiet). SAVE only:
+ * LOAD may need file reads during app startup. Do not acknowledge the save or
+ * change ownership here; just return the same negative result as age-out.
+ * Direct-CRAM callers must retain their DMA buffer until the host drains it,
+ * exactly as with an aged-out read. No bounce copy will touch the app buffer. */
+static void async_abort_pending_save(void) {
+    if (async_state.active && !async_state.copy_pending &&
+        of_savestate_poll() == 1) {
+        async_state.quarantined = 1;
+        IRQ_MASK &= ~IRQ_MASK_DATASLOT;
+        async_finalize(OF_ERR_TIMEOUT);
+    }
+}
+
 int of_file_async_poll(void) {
     if (async_state.copy_pending)
         async_copy_drain();
@@ -1267,6 +1307,8 @@ int of_file_async_poll(void) {
                     == (DS_STATUS_READY | DS_STATUS_WR_IDLE))) {
             DS_STATUS = DS_STATUS_IRQ_PENDING;
             async_complete(st);
+        } else {
+            async_abort_pending_save();
         }
         file_irq_restore(irq);
 
@@ -1294,7 +1336,9 @@ int of_file_async_poll(void) {
  *  (c) Age-out: a transfer with no DONE after ASYNC_AGE_LIMIT_MS is
  *      failed to the app (OF_ERR_TIMEOUT).  The APF host cannot be
  *      canceled — if the zombie completes later its IRQ lands in the
- *      !active branch of the IRQ service and is cleared harmlessly.
+ *      !active branch of the IRQ service and is cleared harmlessly. Both
+ *      age-out and a pending SAVE quarantine it until DONE + bridge idle;
+ *      clearing logical busy lets the app reach its save boundary promptly.
  *      Recovery-only: today that state wedges the async API forever. */
 #define ASYNC_COPY_SLICE_BYTES 2048u
 #define ASYNC_AGE_LIMIT_MS     2000u   /* < the CD ring depth (5 s), so a
@@ -1304,16 +1348,21 @@ int of_file_async_poll(void) {
                                         * aged-out guard in the IRQ path. */
 
 void of_file_async_tick(void) {
+    uint32_t irq = file_irq_save();
     if (async_state.copy_pending) {
         async_copy_slice(ASYNC_COPY_SLICE_BYTES);
+        file_irq_restore(irq);
         return;
     }
-    if (!async_state.active)
+    if (!async_state.active) {
+        file_irq_restore(irq);
         return;
+    }
 
     uint32_t st = DS_STATUS;
     if (st & DS_STATUS_IRQ_PENDING) {
         of_file_async_irq_service();
+        file_irq_restore(irq);
         return;
     }
     if ((st & DS_STATUS_DONE) &&
@@ -1321,24 +1370,29 @@ void of_file_async_tick(void) {
          == (DS_STATUS_READY | DS_STATUS_WR_IDLE))) {
         DS_STATUS = DS_STATUS_IRQ_PENDING;
         async_complete(st);
+        file_irq_restore(irq);
         return;
     }
 
-    if (++async_state.age_ms >= ASYNC_AGE_LIMIT_MS) {
+    async_abort_pending_save();
+    if (async_state.active && ++async_state.age_ms >= ASYNC_AGE_LIMIT_MS) {
         of_term_printf("[file] async age-out: no DONE after %us (st=%02x)\n",
                        (unsigned)(ASYNC_AGE_LIMIT_MS / 1000u),
                        (unsigned)(st & 0xFF));
         IRQ_MASK &= ~IRQ_MASK_DATASLOT;
+        async_state.quarantined = 1;
         async_finalize(OF_ERR_TIMEOUT);
     }
+    file_irq_restore(irq);
 }
 
 int of_file_async_busy(void) {
     return async_state.active;
 }
 
-/* No async transfer in flight and no deferred bounce copy pending: nothing
- * will touch CRAM0 until the next file call. */
+/* No CPU-side completion/copy can claim CRAM0. A quarantined host DMA can
+ * still write its original file staging region, separate from the savestate
+ * window; it cannot invoke a callback or reclaim CRAM0 ownership. */
 int of_file_cram0_quiet(void) {
     return !async_state.active && !async_state.copy_pending;
 }
