@@ -37,10 +37,25 @@
  * by the OS (saves at once when save states are not enabled; loads after
  * 30 s).
  *
- * The Pocket reads back the whole declared size on every save.  To keep
- * saves short, declare the real size just for the hand-over:
- * of_savestate_enable(n) before of_savestate_save(buf, n), then the maximum
- * again afterwards.
+ * The OS hands the Pocket only the state just saved (header + payload), not
+ * the maximum declared with of_savestate_enable(), so saves stay short and
+ * carry no stale bytes.  (Apps that declare the real size around each save,
+ * as pico8pocket and Butterscotch did before this, keep working.)
+ *
+ * Lessons from the first two ports (pico8pocket, Butterscotch/Undertale):
+ *  - The Pocket files Memories and the sleep state under whatever is loaded
+ *    in data slot 0.  A core that launches through a launcher/instance file
+ *    in slot 0 gets every game's Memories in one list, so put your own game
+ *    identity in the state, refuse a state from another game, and tell the
+ *    player why: the Pocket itself only says "Load failed".
+ *  - Refusing a save during sleep does not keep the Pocket awake: it powers
+ *    off anyway, and the next wake loads the previous sleep state.  Refuse
+ *    only what cannot be restored, and say so on screen.
+ *  - Set "sleep_supported" in core.json only when the runtime you ship has
+ *    this service (OF_HW_SAVESTATE); otherwise sleep turns into a cold boot.
+ *  - A save or load is refused with OF_ERR_BUSY if the file layer does not
+ *    go idle within two seconds (a streaming callback that keeps submitting
+ *    reads), rather than waiting forever.
  *
  * The core's core.json must also set "sleep_supported": true for the Pocket
  * to offer sleep.
