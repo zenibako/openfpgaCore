@@ -41,7 +41,8 @@ static uint32_t mie = 8u;
 static int completions, hold_count, initial_hold;
 static int ss_present(void) { return 1; }
 static void fence(void) {}
-static void ss_quiesce_files(void) {}
+static int quiesce_ok = 1, refusals;
+static int ss_quiesce_files(void) { return quiesce_ok; }
 static uint32_t ss_irq_save(void) { uint32_t p = mie; mie = 0; return p; }
 static void ss_irq_restore(uint32_t p) { mie = p; }
 static void of_save_begin_cpu(void) { ++hold_count; CRAM0_MODE = CRAM0_MODE_CPU; }
@@ -51,7 +52,10 @@ static void of_save_end_cpu(void) {
 }
 static int of_save_cpu_held(void) { return hold_count != 0; }
 static void ss_complete(int kind, int ok) {
+    if (!ok) { assert(kind == SS_SAVE && !quiesce_ok); ++refusals; return; }
     assert(kind == SS_SAVE && ok == 1 && mie == 0);
+    /* The host is asked for this state only: header + padded payload. */
+    assert(SS_SIZE == SS_HEADER_BYTES + 8u);
     assert(CRAM0_MODE == CRAM0_MODE_BRIDGE);
     assert(hold_count == initial_hold);
     assert(window[0] == SS_MAGIC && window[3] == 7);
@@ -137,11 +141,11 @@ static void run(uint32_t start, uint32_t delay, uint32_t words, int expected, in
     assert(CRAM0_MODE == (held ? CRAM0_MODE_CPU : CRAM0_MODE_BRIDGE));
     assert(memcmp((uint8_t *)window + SS_HEADER_BYTES, payload, sizeof(payload)) == 0);
     assert(window[4] == crc32_buf(payload, sizeof(payload)));
-    /* The host reads SS_SIZE bytes: everything after the payload up to
-     * there is zeroed, and nothing beyond it is touched. */
+    /* The last payload word is zero-padded; nothing after the state is
+     * touched, and the app's declared size is back for the next request. */
     assert(((uint8_t *)window)[SS_HEADER_BYTES + sizeof(payload)] == 0);
-    for (uint32_t w = 10; w < declared_size / 4u; w++) assert(window[w] == 0);
-    for (uint32_t w = declared_size / 4u; w < 32; w++) assert(window[w] == 0xccccccccu);
+    for (uint32_t w = 10; w < 32; w++) assert(window[w] == 0xccccccccu);
+    assert(SS_SIZE == declared_size);
     if (expected == OF_ERR_TIMEOUT) assert(elapsed >= SS_HOST_READ_TIMEOUT_MS);
     else assert(elapsed < SS_HOST_READ_TIMEOUT_MS);
     /* An app reporting the returned error must not emit another toggle. */
@@ -156,10 +160,20 @@ int main(void) {
     run(UINT32_MAX - 2500u, 3000, 10, 0, 1); /* success across timer wrap */
     run(UINT32_MAX - 2500u, 3000, 0, OF_ERR_TIMEOUT, 1);
     run(UINT32_MAX - 2500u, 3000, 9, OF_ERR_TIMEOUT, 0);
-    declared_size = 56;                 /* a declared maximum above the payload */
-    run(0, 3000, 14, 0, 0);             /* the zeroed tail is part of the read */
-    run(0, 3000, 13, OF_ERR_TIMEOUT, 0);
+    declared_size = 56;                 /* a declared maximum above the payload: */
+    run(0, 3000, 10, 0, 0);             /* only the state itself is read */
+    run(0, 3000, 9, OF_ERR_TIMEOUT, 0);
     declared_size = 40;
+    {   /* File layer never idle: refused, CRAM0 untouched, no hand-over. */
+        const uint8_t payload[7] = {1,2,3,4,5,6,7};
+        memset(window, 0xcc, sizeof(window));
+        quiesce_ok = 0; ss_pending = SS_SAVE; ss_max_payload = 7; refusals = 0;
+        SS_SIZE = declared_size; completions = 0; hold_count = 0;
+        assert(of_savestate_save(payload, sizeof(payload)) == OF_ERR_BUSY);
+        assert(refusals == 1 && completions == 0 && ss_pending == SS_NONE);
+        assert(window[0] == 0xccccccccu && SS_SIZE == declared_size);
+        quiesce_ok = 1;
+    }
     puts("PASS: actual save complete/partial/zero, timer wrap, ownership, one toggle");
 }
 '''

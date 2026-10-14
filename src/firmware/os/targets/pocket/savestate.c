@@ -45,6 +45,7 @@
 #define SS_HOST_READ_TIMEOUT_MS  10000u
 #define SS_LOAD_PICKUP_TIMEOUT_MS 30000u
 #define SS_DRAIN_TIMEOUT_MS      2000u
+#define SS_QUIESCE_TIMEOUT_MS    2000u
 
 enum { SS_NONE = 0, SS_SAVE = 1, SS_LOAD = 2 };
 
@@ -171,10 +172,18 @@ static void ss_sample(void) {
 }
 
 /* Wait for any in-flight async file transfer (and its deferred bounce copy)
- * so nothing flips CRAM0 to the CPU behind our back. */
-static void ss_quiesce_files(void) {
-    while (of_file_async_busy() || !of_file_cram0_quiet())
+ * so nothing flips CRAM0 to the CPU behind our back.  Bounded: polling runs
+ * the app's completion callback, and a streaming app (music) may submit its
+ * next read from there, so the file layer need never go idle.  Returns 0 if
+ * it is still busy at the deadline; the caller then refuses the request. */
+static int ss_quiesce_files(void) {
+    uint32_t t0 = of_timer_get_ms();
+    while (of_file_async_busy() || !of_file_cram0_quiet()) {
+        if ((uint32_t)(of_timer_get_ms() - t0) >= SS_QUIESCE_TIMEOUT_MS)
+            return 0;
         of_file_async_poll();
+    }
+    return 1;
 }
 
 static int ss_cram0_parkable(void) {
@@ -286,7 +295,10 @@ int of_savestate_save(const void *blob, uint32_t len) {
         return OF_ERR_INVALID_PARAM;
     }
 
-    ss_quiesce_files();
+    if (!ss_quiesce_files()) {
+        of_savestate_finish(0);
+        return OF_ERR_BUSY;
+    }
 
     ss_header_t h = {
         .magic = SS_MAGIC,
@@ -300,18 +312,16 @@ int of_savestate_save(const void *blob, uint32_t len) {
     fence();
     ss_write_words(0, (const uint8_t *)&h, sizeof(h));
     ss_write_words(SS_HEADER_BYTES / 4u, (const uint8_t *)blob, len);
-    /* The host reads SS_SIZE bytes whatever the payload length: zero the
-     * rest so a state file never carries an earlier state's tail. */
-    {
-        uint32_t used = (SS_HEADER_BYTES + len + 3u) / 4u;
-        uint32_t end = SS_SIZE / 4u;
-        if (end > SS_WINDOW_SIZE / 4u)
-            end = SS_WINDOW_SIZE / 4u;
-        for (uint32_t w = used; w < end; w++)
-            SS_BLOB[w] = 0;
-    }
     fence();
     of_save_end_cpu();
+
+    /* The host reads exactly SS_SIZE bytes, whatever the payload length.
+     * Declare just this state (header + payload, word-rounded; ss_write_words
+     * zero-pads the last word) for the hand-over, so the Pocket reads and
+     * stores no stale tail and no more than it needs, then put back what the
+     * app declared for the next request.  Both ports did this by hand first. */
+    uint32_t declared_size = SS_SIZE;
+    SS_SIZE = SS_HEADER_BYTES + ((len + 3u) & ~3u);
 
     /* The host reads the blob only after it sees "ok", and only while the
      * bridge owns CRAM0.  Hand it over and keep it there until all SS_SIZE
@@ -335,6 +345,7 @@ int of_savestate_save(const void *blob, uint32_t len) {
     /* "Blob ready" was already signalled once, before the host could read.
      * Report an incomplete read to the app without issuing a second toggle. */
     int result = ss_read_stable(&SS_RD_WORDS) >= want_words ? 0 : OF_ERR_TIMEOUT;
+    SS_SIZE = declared_size;
 
     if (prev_mode && of_save_cpu_held()) {
         CRAM0_MODE = CRAM0_MODE_CPU;
@@ -353,7 +364,10 @@ int of_savestate_load(void *buf, uint32_t cap) {
         return OF_ERR_INVALID_PARAM;
     }
 
-    ss_quiesce_files();
+    if (!ss_quiesce_files()) {
+        of_savestate_finish(0);
+        return OF_ERR_BUSY;
+    }
 
     /* Let any blob words still queued in the bridge write FIFO land. */
     CRAM0_MODE = CRAM0_MODE_BRIDGE;

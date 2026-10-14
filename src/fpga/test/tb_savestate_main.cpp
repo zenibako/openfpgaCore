@@ -221,10 +221,10 @@ static void test_load() {
 
 /* A fresh FPGA model per wake is important: toggling por_n alone does not
  * recreate core_bridge_cmd's power-up initial state. Exercise the real
- * A4-in-reset -> app registration -> A0 protocol twice after wake. The
+ * A4-in-reset -> app registration -> A0 protocol over three wakes. The
  * CPU serializer and host SD persistence are external to this RTL model. */
-static void test_two_sleep_wake_cycles() {
-    std::printf("test_two_sleep_wake_cycles:\n");
+static void test_sleep_wake_cycles() {
+    std::printf("test_sleep_wake_cycles:\n");
     uint32_t previous_words = 3;
     for (unsigned cycle = 0; cycle < 3; ++cycle) {
         delete tb;
@@ -282,7 +282,7 @@ int main(int argc, char **argv) {
     test_load();
     test_wake_before_app();
     test_warm_reset();
-    test_two_sleep_wake_cycles();
+    test_sleep_wake_cycles();
     std::printf("\n=== Results: %d passed, %d failed ===\n", passes, fails);
     delete tb;
     return fails == 0 ? 0 : 1;
