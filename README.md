@@ -33,6 +33,22 @@ make sdk DEST=<sdk checkout> # copy headers and runtime into an SDK checkout
 `make use-mister` or `make use-os30` sets a sticky default; `make` lists all
 goals.
 
+## Save states (Pocket)
+
+Pocket sleep/wake and Memories are one feature, switched per app by
+`"sleep_supported"` in the core's `core.json` (`dist/core/core.json` ships
+`false`):
+
+- `true`: the Pocket offers sleep and Memories (Create Memory, load a
+  Memory), and the OS forwards each request to the app.
+- `false`: Memories are greyed out and sleep powers the Pocket off, even on
+  a bitstream with save-state support.
+
+The Pocket reads it once when the core loads, so it cannot change at run
+time. Set it `true` only for an app that implements save states, and call
+`of_savestate_enable()` only in an app shipped with it `true`; see
+`src/firmware/api/of_savestate.h` for the API.
+
 ## Acknowledgments
 
 VexiiRiscv (SpinalHDL, Charles Papon), musl libc, Analogizer and SNAC
