@@ -38,6 +38,11 @@ void of_term_init(void);
 /* Print a single character (handles \n, \r, \b) */
 void of_term_putchar(char c);
 
+/* While quiet, of_term_putchar/puts/printf draw nothing (the resume boot
+ * screen shows one line and no status chatter).  Defined once in
+ * targets/pocket/terminal.c, which the mister and sim shims include. */
+void of_term_set_quiet(int on);
+
 /* Print a null-terminated string */
 void of_term_puts(const char *s);
 

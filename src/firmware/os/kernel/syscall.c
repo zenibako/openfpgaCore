@@ -506,11 +506,16 @@ static int file_slot_lookup(const char *path) {
         full++;
     for (int i = 0; i < file_slot_count; i++) {
         if (stricmp(full, file_slots[i].filename) == 0) {
-            char cur[FILE_SLOT_NAME_MAX];
-            cur[0] = '\0';
-            if (of_file_get_name(file_slots[i].slot_id, cur, sizeof(cur)) == 0 &&
-                cur[0] && stricmp(cur, file_slots[i].filename) != 0)
-                continue;   /* stale mapping — see the basename pass below */
+            /* Pocket slots are fixed for this launch. GETFILE also issues a
+             * primer read, which can block behind an unacknowledged LOAD.
+             * Dynamic targets still validate mappings after remounts. */
+            if (OF_TARGET_PLATFORM_ID != OF_PLATFORM_POCKET) {
+                char cur[FILE_SLOT_NAME_MAX];
+                cur[0] = '\0';
+                if (of_file_get_name(file_slots[i].slot_id, cur, sizeof(cur)) == 0 &&
+                    cur[0] && stricmp(cur, file_slots[i].filename) != 0)
+                    continue;   /* stale mapping — see the basename pass below */
+            }
             return (int)file_slots[i].slot_id;
         }
     }
@@ -541,11 +546,13 @@ static int file_slot_lookup(const char *path) {
              * every data open read 256 KB of zeros).  Trust the hit only if
              * the id's CURRENT name still matches; otherwise fall through
              * to live resolution below. */
-            char cur[FILE_SLOT_NAME_MAX];
-            cur[0] = '\0';
-            if (of_file_get_name(file_slots[i].slot_id, cur, sizeof(cur)) == 0 &&
-                cur[0] && stricmp(path_basename(cur), name) != 0)
-                continue;
+            if (OF_TARGET_PLATFORM_ID != OF_PLATFORM_POCKET) {
+                char cur[FILE_SLOT_NAME_MAX];
+                cur[0] = '\0';
+                if (of_file_get_name(file_slots[i].slot_id, cur, sizeof(cur)) == 0 &&
+                    cur[0] && stricmp(path_basename(cur), name) != 0)
+                    continue;
+            }
             return (int)file_slots[i].slot_id;
         }
     }
@@ -2054,6 +2061,28 @@ static int mmap_alloc_slot(void) {
         if (!mmap_slots[i].base)
             return i;
     return -1;
+}
+
+/* Read-only sufficient condition, not a free-memory estimate. Deliberately
+ * ignore reusable mappings: proving those usable could require splitting or
+ * coalescing. No allocation, memset, reclamation, or tracker writes here.
+ * Call synchronously with app allocation quiescent (as with mmap itself).
+ * A positive answer is immediate capacity, not a reservation across calls. */
+int syscall_heap_can_reserve(uint32_t bytes)
+{
+    if (!bytes || bytes > UINT32_MAX - 4095u) return 0;
+    uintptr_t len = ((uintptr_t)bytes + 4095u) & ~(uintptr_t)4095u;
+    uintptr_t mb = *(volatile uintptr_t *)&mmap_bottom;
+    uintptr_t cb = *(volatile uintptr_t *)&current_brk;
+    uintptr_t bb = *(volatile uintptr_t *)&brk_base;
+    if (bb < 0x10000000u || cb < bb || cb > mb ||
+        mb > 0x40000000u || (mb & 4095u) || len > mb - cb)
+        return 0;
+    if (mmap_slots_used < 0 || mmap_slots_used >= MMAP_SLOTS)
+        return 0;
+    /* Bounded scan of at most MMAP_SLOTS entries; base==0 means unused,
+     * while a free mapping still occupies its bookkeeping slot. */
+    return mmap_alloc_slot() >= 0;
 }
 
 static long sys_mmap2(long addr, long length, long prot,

@@ -788,6 +788,7 @@ set_global_assignment -name QIP_FILE apf/apf.qip
 set_global_assignment -name QIP_FILE apf/mf_ddio_bidir_12.qip
 set_global_assignment -name VERILOG_FILE core_top.v
 set_global_assignment -name VERILOG_FILE core_bridge_cmd.v
+set_global_assignment -name VERILOG_FILE savestate_ctrl.v
 set_global_assignment -name MIF_FILE firmware.mif
 set_global_assignment -name VERILOG_FILE io_sdram.v
 set_global_assignment -name QIP_FILE megafunctions/mf_pllbase.qip

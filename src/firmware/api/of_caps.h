@@ -200,6 +200,11 @@ extern "C" {
                                          * cone (EXCLUDE_GPU_LIGHT) while the
                                          * rest of the transform front-end is
                                          * live.  Tracks INCLUDE_GPU_LIGHT. */
+#define OF_HW_SAVESTATE     (1u << 31)  /* APF save states + sleep/wake: the
+                                         * bitstream answers the Pocket's
+                                         * 0x00A0/0x00A4 commands and the OS
+                                         * exposes of_savestate_* (see
+                                         * of_savestate.h). */
 #define OF_HW_GPU_COMBINE   (1 << 27)   /* GPU full texel*C+D color combiner
                                          * (HILITE/specular class, e.g. the SM64
                                          * title/Goddard Mario head).  Truecolor

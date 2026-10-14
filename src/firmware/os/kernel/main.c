@@ -11,6 +11,7 @@
 
 #include "../hal/hal.h"
 #include "../hal/memtest.h"
+#include "../hal/savestate.h"
 #include "syscall.h"
 #include "loader.h"
 #include "caps_table.h"
@@ -95,7 +96,16 @@ void os_finalize_memory(void *bss_start, void *bss_end) {
 /* Draw boot logo. First call clears screen, subsequent calls just recolor. */
 static int logo_drawn = 0;
 
+/* Set once the core/os pairing is verified: the host pushed a save state
+ * before we started (wake from sleep, or a Memory opened from the Pocket's
+ * menu), so this boot ends in the app picking up where it was.  The screen
+ * then shows a single "Resuming..." line -- no logo, no status lines --
+ * unless something fails, in which case the terminal is un-muted. */
+static int boot_resuming;
+
 static void boot_logo(const char *color) {
+    if (boot_resuming)
+        return;                 /* the resume screen is one line, drawn once */
     if (!logo_drawn) {
         of_term_clear();
         logo_drawn = 1;
@@ -120,6 +130,7 @@ static void status_ok(void) {
 }
 
 static void status_fail(void) {
+    of_term_set_quiet(0);       /* a failed resume boot must be readable */
     of_term_puts(" \033[91mFAIL\033[0m\n");
 }
 
@@ -451,6 +462,15 @@ void os_main(void) {
         }
     }
 
+    /* The save-state registers are safe to read now that the contract
+     * revision matches.  Swap the logo for the resume notice at once. */
+    if (of_savestate_boot_pending()) {
+        boot_resuming = 1;
+        of_term_clear();
+        of_term_puts("\033[H\033[0mResuming...");
+        of_term_set_quiet(1);
+    }
+
     /* Physical-layer check the contract handshake can't make: controller
      * interleave / DQ-capture mismatches and timing-marginal cores all
      * present as scrambled memory.  Runs before the FS/app half of HAL
@@ -635,8 +655,9 @@ void os_main(void) {
     os_apply_instance_roots();
 #endif
 
-    /* Brief pause to show banner */
-    of_timer_delay_ms(800);
+    /* Brief pause to show banner (not when resuming: get back to the game) */
+    if (!boot_resuming)
+        of_timer_delay_ms(800);
     os_textguard_check("after config_load");
 
     /* Load application ELF */
@@ -764,7 +785,8 @@ void os_main(void) {
             of_term_enable_uart_mirror();
     }
 
-    of_timer_delay_ms(300);
+    if (!boot_resuming)
+        of_timer_delay_ms(300);
 
     /* Boot stage: blue logo = launching app. Save/restore cursor so
      * the redraw (which jumps to 0,0) doesn't leave the cursor inside
@@ -776,7 +798,8 @@ void os_main(void) {
         boot_logo("\033[94m");  /* blue */
         of_term_set_pos(saved_col, saved_row);
     }
-    of_timer_delay_ms(200);
+    if (!boot_resuming)
+        of_timer_delay_ms(200);
 
     /* Boot is done — every init/probe sector op above ran fail-fast.
      * From here on the target may treat transport timeouts as transient
@@ -794,6 +817,7 @@ void os_main(void) {
     of_video_console_reveal();
     for (int i = 0; i < 50; i++) of_timer_delay_ms(100);
 #endif
+    of_term_set_quiet(0);       /* the app (and any trap banner) may print */
     elf_exec(&app, app_argc, app_argv);
 
     /* Should never reach here */

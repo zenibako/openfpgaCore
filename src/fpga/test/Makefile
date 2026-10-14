@@ -142,6 +142,22 @@ BRIDGE_CMD_FLAGS = -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-CASEINCOMPLETE \
                    -Wno-SYNCASYNCNET -Wno-UNUSEDSIGNAL
 
 # ============================================================
+# Pocket save-state handshake — savestate_ctrl answering the host's
+# 0x00A0 / 0x00A4 commands through the real core_bridge_cmd FSM.
+# ============================================================
+SAVESTATE_SRCS = \
+	tb_savestate.v \
+	altsyncram_stub.v \
+	$(TARGET_DIR)/core_bridge_cmd.v \
+	$(TARGET_DIR)/savestate_ctrl.v \
+	$(TARGET_DIR)/apf/mf_datatable.v \
+	$(TARGET_DIR)/apf/common.v
+
+SAVESTATE_CPP = tb_savestate_main.cpp
+SAVESTATE_TOP = tb_savestate
+SAVESTATE_DIR = obj_dir_savestate
+
+# ============================================================
 # Pocket bridge RX CDC — phase sweep of the REAL io_bridge_peripheral.
 # bridge_spiclk and clk_74a are both 74.25 MHz with a power-up-latched
 # relative phase; the harness sweeps that phase in sub-ns steps while
@@ -615,10 +631,10 @@ SYSTEM_FLAGS = -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-CASEINCOMPLETE \
 # Targets
 # ============================================================
 .PHONY: all sdram sdram-serialize sdram-native2 sdram-wcont0 sdram-all sdram-cont sram scanout scanout-lean analogchain gpu gpu-persp gpu-floor gpu-gpudemo gpu-acceptance gpu-acceptance-single gpu-acceptance-os30 gpu-acceptance-zraw gpu-acceptance-burst2 gpu-acceptance-all gpu-acceptance-nomac gpu-elab-nomac-noclip gpu-chain \
-        gpu-wrpath gpu-wstall scanout-race scanout-race-pocket axi-periph bridge-cmd bridge-rx audio audio-mixer arbiter system system-mister run run-sram build clean \
+        gpu-wrpath gpu-wstall scanout-race scanout-race-pocket axi-periph bridge-cmd savestate bridge-rx audio audio-mixer arbiter system system-mister run run-sram build clean \
         cram1-tex-chain cram1-cmap-chain gpu-cram1-repro
 
-all: sdram-all sram gpu gpu-persp axi-periph bridge-cmd bridge-rx audio audio-mixer arbiter hps-bridge hps-mouse hps-keyboard skid ddr3-fb
+all: sdram-all sram gpu gpu-persp axi-periph bridge-cmd savestate bridge-rx audio audio-mixer arbiter hps-bridge hps-mouse hps-keyboard skid ddr3-fb
 
 .PHONY: cpu-target-port gpu-math lsu-coalescer-proof
 cpu-target-port: obj_dir_cpu_port/Vcpu_target_port obj_dir_cpu_port_per/Vcpu_target_port_per
@@ -1406,6 +1422,16 @@ $(AXI_PERIPH_DIR)/V$(AXI_PERIPH_TOP): $(AXI_PERIPH_SRCS) $(AXI_PERIPH_CPP)
 		--top-module $(AXI_PERIPH_TOP) --Mdir $(AXI_PERIPH_DIR) \
 		-I$(COMMON_DIR) \
 		$(AXI_PERIPH_SRCS) $(AXI_PERIPH_CPP)
+
+# --- Pocket save-state handshake ---
+savestate: $(SAVESTATE_DIR)/V$(SAVESTATE_TOP)
+	@printf "\n=== Pocket save-state handshake ===\n"
+	./$(SAVESTATE_DIR)/V$(SAVESTATE_TOP)
+
+$(SAVESTATE_DIR)/V$(SAVESTATE_TOP): $(SAVESTATE_SRCS) $(SAVESTATE_CPP)
+	$(VERILATOR) $(VERILATOR_FLAGS) $(BRIDGE_CMD_FLAGS) \
+		--top-module $(SAVESTATE_TOP) --Mdir $(SAVESTATE_DIR) \
+		$(SAVESTATE_SRCS) $(SAVESTATE_CPP)
 
 # --- Pocket bridge command FSM ---
 bridge-cmd: $(BRIDGE_CMD_DIR)/V$(BRIDGE_CMD_TOP)

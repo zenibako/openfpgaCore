@@ -605,6 +605,46 @@ static void test_stream_empty_and_full(void) {
     check(pos_full > 200, "full-ring position advances freely");
 }
 
+// Repeated audio reset used by save-state restore. A three-pair tail holds
+// below STREAM_FLOOR, so readback must reflect the CPU reset without playback.
+static void test_stream_restore_position_readback(void) {
+    printf("test_stream_restore_position_readback:\n");
+    reset_dut();
+    const int V = 31;
+    sdram_fill_range(0, 1024, 0x10001000);
+    mmio_voice_write(V, VTBL_ADDR, 0);
+    mmio_voice_write(V, VTBL_LEN, 1024);
+    mmio_voice_write(V, VTBL_RATE, 0x10000);
+    mmio_voice_write(V, VTBL_LOOP_START, 0);
+    mmio_voice_write(V, VTBL_LOOP_END, 1024);
+    mmio_voice_write(V, VTBL_VOL_LR, 0xFFFF);
+    mmio_voice_write(V, VTBL_VOL_TARGET, 0xFFFF);
+    mmio_voice_write(V, VTBL_VOL_RATE, 4);
+    mmio_voice_write(V, VTBL_POS_INT, 0);
+    mmio_voice_write(V, VTBL_WPTR, 256);
+    mmio_voice_write(V, VTBL_CTRL, CTRL_ACTIVE | CTRL_STEREO | CTRL_LOOP | CTRL_STREAM);
+    run_samples(300);
+    check(read_pos(V) > 200, "pre-restore stream has nonzero position");
+    for (int cycle = 0; cycle < 2; cycle++) {
+        mmio_voice_write(V, VTBL_CTRL, 0);
+        tick(200);
+        mmio_voice_write(V, VTBL_POS_INT, 0);
+        mmio_voice_write(V, VTBL_WPTR, 0);
+        tick(200);
+        check_eq_u32("inactive reset commits position table", vtbl_read(V, VTBL_POS_INT), 0);
+        check_eq_u32("inactive reset also commits position readback", read_pos(V), 0);
+        mmio_voice_write(V, VTBL_WPTR, 3);
+        mmio_voice_write(V, VTBL_CTRL, CTRL_ACTIVE | CTRL_STEREO | CTRL_LOOP | CTRL_STREAM);
+        run_samples(128);
+        check_eq_u32("three-pair restore holds real position", vtbl_read(V, VTBL_POS_INT), 0);
+        check_eq_u32("three-pair restore readback stays zero", read_pos(V), 0);
+        check_eq_u32("firmware sees exactly three queued pairs", (3 - read_pos(V)) & 1023, 3);
+        mmio_voice_write(V, VTBL_WPTR, 256);
+        run_samples(300);
+        check(read_pos(V) > 200, "restored stream refills and advances");
+    }
+}
+
 // Test 7b: stream voice at the firmware-clamped MAXIMUM rate (2.0).
 // Position steps by up to 2 (+1 frac carry) per pass, the worst case
 // the STREAM_FLOOR=4 margin must absorb: the voice must still hold
@@ -971,6 +1011,7 @@ int main(int argc, char **argv) {
     test_stream_hold_resume();
 
     test_stream_empty_and_full();
+    test_stream_restore_position_readback();
     test_stream_quiet_is_per_voice();
 
     test_stream_max_rate();

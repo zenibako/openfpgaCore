@@ -328,6 +328,19 @@ struct of_services_table {
      * dock/undock happens at runtime, so re-check across frames.
      * Always 1 on console targets (MiSTer). */
     int       (*input_is_docked)(void);
+
+    /* -- Save states / sleep (append-only) --
+     * Pocket bitstreams with OF_HW_SAVESTATE.  See of_savestate.h. */
+    int       (*savestate_enable)(uint32_t max_size);
+    int       (*savestate_poll)(void);
+    int       (*savestate_save)(const void *blob, uint32_t len);
+    int       (*savestate_load)(void *buf, uint32_t cap);
+    void      (*savestate_finish)(int ok);
+
+    /* -- Heap capacity query (append-only) --
+     * Read-only sufficient condition for a fresh mmap carve, including a
+     * tracking slot. Zero means unknown; it is not allocation failure. */
+    int       (*heap_can_reserve)(uint32_t bytes);
 };
 
 #ifndef OF_PC

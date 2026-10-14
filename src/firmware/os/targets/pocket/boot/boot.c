@@ -267,6 +267,15 @@ static void boot_fb_puts0(int row, const char *s) {
     boot_fb_puts(0, row, s);
 }
 
+/* The host pushed a save state before releasing us (wake from sleep, or a
+ * Memory opened from the Pocket menu): say "Resuming..." instead of the
+ * cold-boot text.  This ROM ships inside its own bitstream, so the register
+ * exists whenever the feature bit is set. */
+__attribute__((section(".text.boot"), noinline))
+static int boot_resume_pending(void) {
+    return (HW_FEATURES & (1u << 31)) && (SS_STATUS & SS_STATUS_LOAD_REQ);
+}
+
 __attribute__((section(".text.boot"), noinline))
 static void boot_warmup_note(const char *label, int hexcol, unsigned n) {
     boot_fb_puts0(1, label);
@@ -1032,7 +1041,7 @@ int main(void) {
         for (int i = 0; i < (320 * 240) / 4; i++) p[i] = 0;
     }
 
-    boot_fb_puts0(0, "Booting...");
+    boot_fb_puts0(0, boot_resume_pending() ? "Resuming..." : "Booting...");
 
     /* ── PHDP Discovery ─────────────────────────────────────────── */
     int debug_mode = 0;
@@ -1106,7 +1115,7 @@ int main(void) {
 load_from_sd:
     /* ── Standard SD card boot ──────────────────────────────────── */
     boot_fb_clear_row(0);
-    boot_fb_puts0(0, "Loading...");
+    boot_fb_puts0(0, boot_resume_pending() ? "Resuming..." : "Loading...");
 
     pd_dbg_stage = 3;
 

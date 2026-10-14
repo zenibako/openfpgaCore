@@ -26,6 +26,7 @@
 #include "../hal/hal.h"
 #include "../hal/regs.h"
 #include "../hal/file.h"
+#include "../hal/savestate.h"
 
 /* ======================================================================
  * Wrappers for SDK/HAL signature mismatches
@@ -60,6 +61,7 @@ static void svc_input_read_mouse_state(void *out) {
 
 /* Timer policy is owned by syscall.c (shared 1 kHz tick + SW-mixer pump). */
 extern void of_os_timer_set_callback(void (*cb)(void), uint32_t app_hz, int self_divide);
+extern int syscall_heap_can_reserve(uint32_t bytes);
 
 static inline uint32_t svc_irq_save_local(void)
 {
@@ -281,6 +283,14 @@ void services_table_init(void) {
 
     /* Dock state */
     svc->input_is_docked = of_input_is_docked;
+
+    /* Save states / sleep */
+    svc->savestate_enable = of_savestate_enable;
+    svc->savestate_poll   = of_savestate_poll;
+    svc->savestate_save   = of_savestate_save;
+    svc->savestate_load   = of_savestate_load;
+    svc->savestate_finish = of_savestate_finish;
+    svc->heap_can_reserve = syscall_heap_can_reserve;
 }
 
 void services_table_set_smp_bank(const void *base, uint32_t size) {

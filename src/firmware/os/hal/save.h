@@ -29,6 +29,10 @@ void of_save_init(void);
 void of_save_begin_cpu(void);
 void of_save_end_cpu(void);
 
+/* Nonzero while some caller holds CPU ownership of CRAM0 (e.g. an open
+ * nonvolatile file).  Pocket only. */
+int of_save_cpu_held(void);
+
 /* Core-exit security wipe: zero the non-save CRAM0 regions (stale boot
  * staging, DMA scratch, app file-staging pool) so transient loaded data
  * cannot survive a warm reset.  PRESERVES the nonvolatile presave + save

@@ -563,7 +563,15 @@ void term_emit_char(char c) {
     }
 }
 
+static int term_quiet;
+
+void of_term_set_quiet(int on) {
+    term_quiet = on;
+}
+
 void of_term_putchar(char c) {
+    if (term_quiet)
+        return;
     switch (esc_state) {
     case ESC_NONE:
         if (c == '\033') {
