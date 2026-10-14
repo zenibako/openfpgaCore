@@ -744,6 +744,11 @@ always @(posedge clk) begin
 
     // ---- Idle: wait for FIFO to drop below half, then start new sample ----
     S_IDLE: begin
+        // Position readback must follow a queued CPU seek/reset at the same
+        // commit as the voice table. A short restored stream can hold below
+        // STREAM_FLOOR indefinitely, so playback cannot refresh this shadow.
+        if (cpu_fsm_q_drain && !cpu_fsm_commit_is_vol)
+            pos_latch[cpu_fsm_commit_voice] <= cpu_fsm_commit_payload;
         if (!cpu_fsm_q_empty || cpu_fsm_wr) begin
             state <= S_IDLE;
         end else if (mixer_enable && fifo_level[9:8] != 2'b11) begin

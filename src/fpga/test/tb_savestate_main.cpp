@@ -219,6 +219,58 @@ static void test_load() {
     check_eq("load-err", host_cmd(0x00A4, 0), 3);
 }
 
+/* A fresh FPGA model per wake is important: toggling por_n alone does not
+ * recreate core_bridge_cmd's power-up initial state. Exercise the real
+ * A4-in-reset -> app registration -> A0 protocol twice after wake. The
+ * CPU serializer and host SD persistence are external to this RTL model. */
+static void test_two_sleep_wake_cycles() {
+    std::printf("test_two_sleep_wake_cycles:\n");
+    uint32_t previous_words = 3;
+    for (unsigned cycle = 0; cycle < 3; ++cycle) {
+        delete tb;
+        tb = new Vtb_savestate;
+        init();
+        check_eq("reload-starts-in-reset", tb->core_reset_n, 0);
+        for (uint32_t i = 0; i < previous_words; ++i)
+            write32(BLOB + i * 4, 0x51000000u | (cycle << 16) | i);
+        check_eq("wake-blob-arrived", tb->wr_words, previous_words);
+        host_cmd(0x00A4, 1);
+        check_eq("wake-accepted-before-app", host_cmd(0x00A4, 0), 2);
+        check_eq("wake-request-retained", tb->load_req_tgl, 1);
+        check_eq("wake-reset-exit", host_cmd(0x0011, 0), 0);
+        tb->cpu_size = 0x100000;
+        ticks(16);
+        cpu_complete_load(false);
+        tb->cpu_clear_tgl ^= 1;
+        ticks(8);
+        check_eq("wake-running", tb->core_reset_n, 1);
+        check_eq("wake-traffic-count-cleared", tb->wr_words, 0);
+        check_eq("wake-left-no-save-result", host_cmd(0x00A0, 0), 0);
+
+        uint32_t before = tb->start_req_tgl;
+        host_cmd(0x00A0, 1);
+        check_eq("sleep-requests-new-capture", tb->start_req_tgl, before ^ 1);
+        check_eq("sleep-busy-before-new-capture", host_cmd(0x00A0, 0), 1);
+        check_eq("sleep-cannot-reuse-wake-result", tb->rd_words, 0);
+        const uint32_t new_size = 128 + cycle * 16;
+        tb->cpu_size = new_size;
+        ticks(8);
+        cpu_complete_save(false);
+        check_eq("sleep-capture-completed", host_cmd(0x00A0, 0), 2);
+        check_eq("sleep-publishes-new-size", read32(HOST_R48), new_size);
+        previous_words = new_size / 4;
+        for (uint32_t i = 0; i < previous_words; ++i)
+            read32(BLOB + i * 4);
+        check_eq("sleep-host-read-complete", tb->rd_words, previous_words);
+
+        /* Current app behavior: maximum-size rearm after transfer, followed
+         * by physical sleep/reload. Document the sticky query result too. */
+        tb->cpu_size = 0x100000;
+        ticks(8);
+        check_eq("completed-save-remains-queryable", host_cmd(0x00A0, 0), 2);
+    }
+}
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     tb = new Vtb_savestate;
@@ -230,6 +282,7 @@ int main(int argc, char **argv) {
     test_load();
     test_wake_before_app();
     test_warm_reset();
+    test_two_sleep_wake_cycles();
     std::printf("\n=== Results: %d passed, %d failed ===\n", passes, fails);
     delete tb;
     return fails == 0 ? 0 : 1;
