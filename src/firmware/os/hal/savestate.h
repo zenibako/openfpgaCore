@@ -21,6 +21,7 @@ int  of_savestate_poll(void);
 int  of_savestate_save(const void *blob, uint32_t len);
 int  of_savestate_load(void *buf, uint32_t cap);
 void of_savestate_finish(int ok);
+int  of_savestate_set_id(const void *id, uint32_t len);
 
 /* Called from of_check_shutdown() -- the timer IRQ and every busy-wait
  * spin, so at no fixed rate: denies requests that no app will answer (save

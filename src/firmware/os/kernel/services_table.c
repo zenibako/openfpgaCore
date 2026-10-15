@@ -291,6 +291,7 @@ void services_table_init(void) {
     svc->savestate_load   = of_savestate_load;
     svc->savestate_finish = of_savestate_finish;
     svc->heap_can_reserve = syscall_heap_can_reserve;
+    svc->savestate_set_id = of_savestate_set_id;
 }
 
 void services_table_set_smp_bank(const void *base, uint32_t size) {

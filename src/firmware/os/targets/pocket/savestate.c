@@ -22,8 +22,11 @@
  *         of_savestate_finish().
  *
  * The host reads a fixed SS_SIZE (header + the app's declared maximum), so the
- * header carries the real payload length.  It also carries the instance's
- * game id so a state from another game is refused rather than restored.
+ * header carries the real payload length.  It also carries the game id the
+ * app set with of_savestate_set_id() (up to 16 bytes), so an intact state
+ * from another game is refused with OF_ERR_DENIED rather than restored.  An
+ * all-zero id on either side (an app that never set one, or a state written
+ * before ids existed, which left those words 0) is not checked.
  */
 
 #include "savestate.h"
@@ -49,13 +52,19 @@
 
 enum { SS_NONE = 0, SS_SAVE = 1, SS_LOAD = 2 };
 
+/* The id takes the word that used to hold SYS_GAME_ID (never driven, so 0)
+ * and the three reserved words after it; the layout and version are
+ * unchanged, so states saved before ids existed still load. */
+#define SS_ID_BYTES         16u
+#define SS_ID_WORDS         (SS_ID_BYTES / 4u)
+
 typedef struct {
     uint32_t magic;
     uint32_t version;
-    uint32_t game_id;
+    uint32_t game_id;                   /* id bytes 0-3 */
     uint32_t payload_len;
     uint32_t payload_crc;
-    uint32_t reserved[3];
+    uint32_t game_id_ext[SS_ID_WORDS - 1u]; /* id bytes 4-15 */
 } ss_header_t;
 
 _Static_assert(sizeof(ss_header_t) == SS_HEADER_BYTES, "header size");
@@ -67,6 +76,7 @@ static volatile uint32_t ss_max_payload;
 static volatile int      ss_pending;
 static volatile uint32_t ss_seen;          /* last request toggles consumed */
 static volatile uint32_t ss_load_t0_ms;   /* of_timer_get_ms() when a load was seen */
+static uint32_t          ss_id[SS_ID_WORDS]; /* of_savestate_set_id(), little-endian */
 
 static inline uint32_t ss_irq_save(void) {
     uint32_t prev;
@@ -214,6 +224,37 @@ void of_savestate_tick(void) {
     }
 }
 
+int of_savestate_set_id(const void *id, uint32_t len) {
+    if (!ss_present())
+        return OF_ERR_NOT_SUPPORTED;
+    if (len > SS_ID_BYTES || (len && !id))
+        return OF_ERR_INVALID_PARAM;
+    const uint8_t *b = (const uint8_t *)id;
+    uint32_t words[SS_ID_WORDS] = {0};
+    for (uint32_t i = 0; i < len; i++)
+        words[i / 4u] |= (uint32_t)b[i] << (8u * (i % 4u));
+    for (uint32_t w = 0; w < SS_ID_WORDS; w++)
+        ss_id[w] = words[w];
+    return 0;
+}
+
+static int ss_id_zero(const uint32_t *w) {
+    return (w[0] | w[1] | w[2] | w[3]) == 0;
+}
+
+/* Whether a state's id lets it load here: equal ids, or either one unset. */
+static int ss_id_matches(const ss_header_t *h) {
+    uint32_t theirs[SS_ID_WORDS] = {
+        h->game_id, h->game_id_ext[0], h->game_id_ext[1], h->game_id_ext[2],
+    };
+    if (ss_id_zero(ss_id) || ss_id_zero(theirs))
+        return 1;
+    for (uint32_t w = 0; w < SS_ID_WORDS; w++)
+        if (theirs[w] != ss_id[w])
+            return 0;
+    return 1;
+}
+
 int of_savestate_enable(uint32_t max_size) {
     if (!ss_present())
         return OF_ERR_NOT_SUPPORTED;
@@ -303,9 +344,10 @@ int of_savestate_save(const void *blob, uint32_t len) {
     ss_header_t h = {
         .magic = SS_MAGIC,
         .version = SS_VERSION,
-        .game_id = SYS_GAME_ID,
+        .game_id = ss_id[0],
         .payload_len = len,
         .payload_crc = crc32_buf((const uint8_t *)blob, len),
+        .game_id_ext = { ss_id[1], ss_id[2], ss_id[3] },
     };
 
     of_save_begin_cpu();
@@ -391,8 +433,6 @@ int of_savestate_load(void *buf, uint32_t cap) {
     ss_read_words(0, (uint8_t *)&h, sizeof(h));
     if (h.magic != SS_MAGIC || h.version != SS_VERSION)
         rc = OF_ERR_IO;
-    else if (h.game_id != SYS_GAME_ID)
-        rc = OF_ERR_DENIED;
     else if (h.payload_len == 0 || h.payload_len > cap ||
              h.payload_len > SS_WINDOW_SIZE - SS_HEADER_BYTES)
         rc = OF_ERR_BAD_RANGE;
@@ -403,8 +443,12 @@ int of_savestate_load(void *buf, uint32_t cap) {
     fence();
     of_save_end_cpu();
 
+    /* Identity last: a damaged state reports damage, and only an intact
+     * one from another game is OF_ERR_DENIED. */
     if (rc == 0 && crc32_buf((const uint8_t *)buf, h.payload_len) != h.payload_crc)
         rc = OF_ERR_IO;
+    else if (rc == 0 && !ss_id_matches(&h))
+        rc = OF_ERR_DENIED;
 
     if (rc != 0) {
         of_savestate_finish(0);

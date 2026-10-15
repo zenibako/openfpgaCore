@@ -33,6 +33,13 @@ RB="$ROOT/tools/reverse_bits"
 # bld/<variant>/output_files/; publish every variant that has been built,
 # named by the variant token (os25.rbf_r / os30.rbf_r — kept short for the
 # Pocket's ~15-char filename cap).  One SDK can then build cores of either.
+# SAVESTATES lists the published bitstreams built with INCLUDE_SAVESTATE
+# (OF_HW_SAVESTATE), one file name per line, so a game's packaging can set
+# "sleep_supported" in core.json from what it actually ships: true on a
+# bitstream without the service turns sleep into a cold boot.  Read from the
+# job's generated qsf, which records the macros the fit really used.
+SS_LIST="$RTP/SAVESTATES"
+: > "$SS_LIST"
 for d in "$SCRIPT_DIR"/bld/*/output_files; do
     [ -f "$d/ap_core.rbf" ] || continue
     v="$(basename "$(dirname "$d")")"
@@ -43,7 +50,10 @@ for d in "$SCRIPT_DIR"/bld/*/output_files; do
     case "$v" in *-s[0-9]*) continue ;; esac
     "$RB" "$d/ap_core.rbf" "$RTP/$v.rbf_r" >/dev/null
     ok "$v.rbf_r" "runtime/pocket/"
+    grep -qE 'VERILOG_MACRO[[:space:]]+"?INCLUDE_SAVESTATE"?([[:space:]=]|$)' \
+        "$(dirname "$d")/ap_core.qsf" 2>/dev/null && echo "$v.rbf_r" >> "$SS_LIST"
 done
+ok "SAVESTATES ($(paste -sd' ' "$SS_LIST"))" "runtime/pocket/"
 
 # Kernel — the pocket build tree is per-target now, so its os.bin is
 # unambiguously a pocket build (a mister kernel can't land here).
