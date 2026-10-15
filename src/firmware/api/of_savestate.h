@@ -13,6 +13,22 @@
  * with a CRC and the instance's game id, so a corrupt state or one from
  * another game is refused instead of restored.
  *
+ * Turning it on: "sleep_supported" in the core's core.json is the one
+ * switch for both features, per core: every app launched through that
+ * core shares it.  true offers
+ * sleep and Memories ("Create Memory" and loading one); false powers off
+ * instead of sleeping and greys out Memories, even on a bitstream with
+ * OF_HW_SAVESTATE (measured on a Pocket, 2026-10-14).  What the menu
+ * offers is settled when the core loads: a core that stops reporting
+ * support later still has Memories offered, and the save or load it then
+ * refuses just fails.  Set it true only when every app under the core
+ * answers requests as below, on a bitstream with this service (os20 and
+ * os25 have it, os30 does not), and call
+ * of_savestate_enable() only in an app shipped with it true: with it false
+ * the Pocket never asks, and an enabled app only holds memory and CRAM0
+ * handling for nothing.  Neither the app nor the OS can read core.json,
+ * so keep the two in step at build time.
+ *
  * Usage, once per frame at a point where the app's state is consistent:
  *
  *   of_savestate_enable(MY_MAX_STATE);           // once, at startup
@@ -52,13 +68,11 @@
  *    off anyway, and the next wake loads the previous sleep state.  Refuse
  *    only what cannot be restored, and say so on screen.
  *  - Set "sleep_supported" in core.json only when the runtime you ship has
- *    this service (OF_HW_SAVESTATE); otherwise sleep turns into a cold boot.
+ *    this service (OF_HW_SAVESTATE); otherwise sleep turns into a cold boot
+ *    and every Memory fails.
  *  - A save or load is refused with OF_ERR_BUSY if the file layer does not
  *    go idle within two seconds (a streaming callback that keeps submitting
  *    reads), rather than waiting forever.
- *
- * The core's core.json must also set "sleep_supported": true for the Pocket
- * to offer sleep.
  *
  * Contract while enabled: of_savestate_poll() may hand CRAM0 back to the
  * bridge, so do not keep pointers into the CRAM0 app-DMA pool across it.
