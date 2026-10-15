@@ -151,7 +151,9 @@ static inline int of_savestate_save(const void *blob, uint32_t len) {
 /* Copy a pending load's payload into buf.  Returns its length, or an
  * OF_ERR_* (in which case the OS has already told the Pocket it failed):
  * OF_ERR_DENIED for another game's state (see of_savestate_set_id()),
- * OF_ERR_IO for a damaged or short one.
+ * OF_ERR_IO for a damaged or short one, OF_ERR_BAD_RANGE for a header
+ * length of 0 or one larger than cap or the window, and OF_ERR_BUSY when
+ * the file layer does not go idle in time.
  * On success the app must call of_savestate_finish() after restoring. */
 static inline int of_savestate_load(void *buf, uint32_t cap) {
     if (!OF_SAVESTATE_SVC_HAS(savestate_load))
