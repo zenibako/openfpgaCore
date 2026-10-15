@@ -26,7 +26,8 @@ def main():
 #define SS_HOST_READ_TIMEOUT_MS 10000u
 #define CRAM0_MODE_CPU 1u
 #define CRAM0_MODE_BRIDGE 0u
-#define SYS_GAME_ID 123u
+#define SS_ID_WORDS 4u
+static uint32_t ss_id[SS_ID_WORDS] = {0x11u, 0x22u, 0x33u, 0x44u};
 #define SS_NONE 0
 #define SS_SAVE 1
 static volatile uint32_t SS_SIZE, SS_RD_WORDS, CRAM0_MODE;
@@ -141,6 +142,8 @@ static void run(uint32_t start, uint32_t delay, uint32_t words, int expected, in
     assert(CRAM0_MODE == (held ? CRAM0_MODE_CPU : CRAM0_MODE_BRIDGE));
     assert(memcmp((uint8_t *)window + SS_HEADER_BYTES, payload, sizeof(payload)) == 0);
     assert(window[4] == crc32_buf(payload, sizeof(payload)));
+    /* The game id goes into word 2 and the three words after the CRC. */
+    assert(window[2] == 0x11u && window[5] == 0x22u && window[6] == 0x33u && window[7] == 0x44u);
     /* The last payload word is zero-padded; nothing after the state is
      * touched, and the app's declared size is back for the next request. */
     assert(((uint8_t *)window)[SS_HEADER_BYTES + sizeof(payload)] == 0);

@@ -341,6 +341,10 @@ struct of_services_table {
      * Read-only sufficient condition for a fresh mmap carve, including a
      * tracking slot. Zero means unknown; it is not allocation failure. */
     int       (*heap_can_reserve)(uint32_t bytes);
+
+    /* -- Save-state game identity (append-only) --
+     * See of_savestate_set_id() in of_savestate.h. */
+    int       (*savestate_set_id)(const void *id, uint32_t len);
 };
 
 #ifndef OF_PC

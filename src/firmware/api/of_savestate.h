@@ -10,8 +10,8 @@
  * bitstreams with OF_HW_SAVESTATE the OS forwards them to the app.  The app
  * decides what a state contains: the OS only moves an opaque blob (up to the
  * size the app declared) between the app and the Pocket, adding a header
- * with a CRC and the instance's game id, so a corrupt state or one from
- * another game is refused instead of restored.
+ * with a CRC and the game id the app set with of_savestate_set_id(), so a
+ * corrupt state or one from another game is refused instead of restored.
  *
  * Turning it on: "sleep_supported" in the core's core.json is the one
  * switch for both features, per core: every app launched through that
@@ -31,7 +31,8 @@
  *
  * Usage, once per frame at a point where the app's state is consistent:
  *
- *   of_savestate_enable(MY_MAX_STATE);           // once, at startup
+ *   of_savestate_set_id(my_id, sizeof my_id);    // once, at startup
+ *   of_savestate_enable(MY_MAX_STATE);
  *   ...
  *   switch (of_savestate_poll()) {
  *   case OF_SAVESTATE_SAVE:
@@ -42,6 +43,7 @@
  *   case OF_SAVESTATE_LOAD:
  *       n = of_savestate_load(buf, sizeof buf);   // < 0: already refused
  *       if (n > 0) of_savestate_finish(restore(buf, n) == 0);
+ *       else if (n == OF_ERR_DENIED) show("Memory is from another game");
  *       break;
  *   }
  *
@@ -61,9 +63,9 @@
  * Lessons from the first two ports (pico8pocket, Butterscotch/Undertale):
  *  - The Pocket files Memories and the sleep state under whatever is loaded
  *    in data slot 0.  A core that launches through a launcher/instance file
- *    in slot 0 gets every game's Memories in one list, so put your own game
- *    identity in the state, refuse a state from another game, and tell the
- *    player why: the Pocket itself only says "Load failed".
+ *    in slot 0 gets every game's Memories in one list, so set a game id
+ *    (of_savestate_set_id()) and tell the player why a load was refused
+ *    (OF_ERR_DENIED): the Pocket itself only says "Load failed".
  *  - Refusing a save during sleep does not keep the Pocket awake: it powers
  *    off anyway, and the next wake loads the previous sleep state.  Refuse
  *    only what cannot be restored, and say so on screen.
@@ -116,6 +118,22 @@ static inline int of_savestate_enable(uint32_t max_size) {
     return OF_SVC->savestate_enable(max_size);
 }
 
+/* Name the game (cart, data file, version: whatever must match for a state
+ * to restore) so the OS refuses a state from another one.  Up to 16 bytes,
+ * e.g. a hash of the game's data; shorter ids are zero-padded, and len 0
+ * clears it.  of_savestate_load() then returns OF_ERR_DENIED for an intact
+ * state whose id differs, after the length and CRC checks, so a damaged
+ * state still reads as OF_ERR_IO.  Not checked while either id is all
+ * zero: an app that never calls this, or a state saved before ids existed.
+ * The id goes into every later save.  OF_ERR_NOT_SUPPORTED on runtimes
+ * without it (older OS images too), where the app's own check is all
+ * there is. */
+static inline int of_savestate_set_id(const void *id, uint32_t len) {
+    if (!OF_SAVESTATE_SVC_HAS(savestate_set_id))
+        return OF_ERR_NOT_SUPPORTED;
+    return OF_SVC->savestate_set_id(id, len);
+}
+
 /* OF_SAVESTATE_NONE / _SAVE / _LOAD.  Call once per frame. */
 static inline int of_savestate_poll(void) {
     if (!OF_SAVESTATE_SVC_HAS(savestate_poll))
@@ -131,7 +149,11 @@ static inline int of_savestate_save(const void *blob, uint32_t len) {
 }
 
 /* Copy a pending load's payload into buf.  Returns its length, or an
- * OF_ERR_* (in which case the OS has already told the Pocket it failed).
+ * OF_ERR_* (in which case the OS has already told the Pocket it failed):
+ * OF_ERR_DENIED for another game's state (see of_savestate_set_id()),
+ * OF_ERR_IO for a damaged or short one, OF_ERR_BAD_RANGE for a header
+ * length of 0 or one larger than cap or the window, and OF_ERR_BUSY when
+ * the file layer does not go idle in time.
  * On success the app must call of_savestate_finish() after restoring. */
 static inline int of_savestate_load(void *buf, uint32_t cap) {
     if (!OF_SAVESTATE_SVC_HAS(savestate_load))
@@ -147,6 +169,7 @@ static inline void of_savestate_finish(int ok) {
 
 #else /* OF_PC */
 
+static inline int  of_savestate_set_id(const void *id, uint32_t len) { (void)id; (void)len; return OF_ERR_NOT_SUPPORTED; }
 static inline int  of_savestate_enable(uint32_t max_size) { (void)max_size; return OF_ERR_NOT_SUPPORTED; }
 static inline int  of_savestate_poll(void) { return OF_SAVESTATE_NONE; }
 static inline int  of_savestate_save(const void *blob, uint32_t len) { (void)blob; (void)len; return OF_ERR_NOT_SUPPORTED; }

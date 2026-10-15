@@ -54,6 +54,18 @@ bitstream it ships has the service (`OF_HW_SAVESTATE`), and call
 `of_savestate_enable()` only in an app shipped with it `true`; see
 `src/firmware/api/of_savestate.h` for the API.
 
+`make sdk` writes `runtime/pocket/SAVESTATES` in the SDK, listing the
+published bitstreams that have the service, one file name per line (for
+example `os25.rbf_r`). Packaging should set `"sleep_supported"` from that
+file for the bitstream it ships, rather than from whether `of_savestate.h`
+exists: the header ships with every runtime, `os30` included.
+
+The Pocket lists every app's Memories under the core together, so an app
+should name its game with `of_savestate_set_id()` (up to 16 bytes, such as a
+hash of its data). A state from another game then fails to load with
+`OF_ERR_DENIED`, distinct from `OF_ERR_IO` for a damaged one, and the app can
+tell the player why: the Pocket itself only says "Load failed".
+
 ## Acknowledgments
 
 VexiiRiscv (SpinalHDL, Charles Papon), musl libc, Analogizer and SNAC
