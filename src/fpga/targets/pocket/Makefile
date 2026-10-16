@@ -283,11 +283,11 @@ os:
 # mode of quartus-container.sh) — patching a container-built .sof with a
 # host Quartus is exactly the compiler mixing this Makefile forbids.
 firmware: bootloader os
-	@if [ -f $(QOUT)/$(PROJECT).sof ]; then \
-		printf "$(C_HEAD)[fw]$(C_RESET) Patching .sof MIF with new bootloader ($(VARIANT))...\n"; \
-		$(QRUN) bash -c 'quartus_cdb $(PROJECT) --update_mif && quartus_asm $(PROJECT)' > /dev/null 2>&1; \
-		$(MAKE) --no-print-directory install-bitstream; \
-	fi
+	@test -f $(QOUT)/$(PROJECT).sof || { \
+		echo "[fw] Missing $(QOUT)/$(PROJECT).sof; run make build for this job first" >&2; exit 1; }
+	@printf "$(C_HEAD)[fw]$(C_RESET) Patching .sof MIF with new bootloader ($(VARIANT))...\n"
+	@$(QRUN) bash -c 'quartus_cdb $(PROJECT) --update_mif && quartus_asm $(PROJECT)'
+	@$(MAKE) --no-print-directory install-bitstream
 	@printf "$(C_OK)[fw] Done$(C_RESET)\n"
 
 # ── FPGA compile ─────────────────────────────────────────────────────
