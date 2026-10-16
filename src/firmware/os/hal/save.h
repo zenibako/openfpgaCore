@@ -56,6 +56,9 @@ int of_nvslot_read(uint32_t data_slot_id, void *buf,
 int of_nvslot_write(uint32_t data_slot_id, const void *buf,
                     uint32_t offset, uint32_t len);
 int of_nvslot_set_size(uint32_t data_slot_id, uint32_t size);
+/* Complete an SD write after bounded file quiescence. Preserve nested hold
+ * counts, restoring CPU ownership on success. Errors leave a live DMA's
+ * bridge ownership intact. */
 int of_nvslot_flush_size(uint32_t data_slot_id, uint32_t size);
 
 #endif /* OFOS_SAVE_H */

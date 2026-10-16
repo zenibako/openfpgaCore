@@ -43,6 +43,8 @@
 #define SYS_read            63
 #define SYS_write           64
 #define SYS_writev          66
+#define SYS_fsync           82
+#define SYS_fdatasync       83
 #define SYS_readv           65
 #define SYS_fstatat         79      /* legacy — riscv32 musl uses SYS_statx instead */
 #define SYS_fstat           80      /* legacy — riscv32 musl uses SYS_statx instead */
