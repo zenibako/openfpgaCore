@@ -439,8 +439,12 @@ static file_slot_entry_t file_slots[MAX_FILE_SLOTS];
 static int file_slot_count;
 static uint32_t save_size_cache[NV_CACHE_SLOTS];
 static uint8_t save_size_known[NV_CACHE_SLOTS];
+/* A zero read from launcher metadata may hide a populated CRAM archive.
+ * Only an explicit size update (such as O_TRUNC) authorizes flushing zero. */
+static uint8_t save_zero_authoritative[NV_CACHE_SLOTS];
 
 static void save_size_cache_store(int cache_idx, uint32_t size);
+static uint32_t nv_current_size(uint32_t slot_id, int cache_idx);
 
 void file_slot_register(uint32_t slot_id, const char *filename) {
     if (file_slot_count >= MAX_FILE_SLOTS) {
@@ -1249,6 +1253,10 @@ static long sys_write(long fd, long buf, long count) {
     if (f->is_save) {
         if ((f->flags & O_ACCMODE) == 0)
             return -EBADF;
+        /* Descriptors share the slot's logical length. Refresh before
+         * writing so an old descriptor cannot shrink a newer write, and
+         * append observes growth or truncation through another open. */
+        f->size = nv_current_size(f->slot_id, f->nv_cache_idx);
         if (f->flags & O_APPEND)
             f->offset = f->size;
 
@@ -1402,6 +1410,7 @@ static void save_size_cache_store(int cache_idx, uint32_t size) {
         return;
     save_size_cache[cache_idx] = save_clamp_size(size);
     save_size_known[cache_idx] = 1;
+    save_zero_authoritative[cache_idx] = (size == 0);
 }
 
 /* Force a re-read from the HAL on the next save_current_size() call.
@@ -1411,6 +1420,7 @@ static void save_size_cache_invalidate(int cache_idx) {
     if (cache_idx < 0 || cache_idx >= (int)NV_CACHE_SLOTS)
         return;
     save_size_known[cache_idx] = 0;
+    save_zero_authoritative[cache_idx] = 0;
 }
 
 static uint32_t nv_current_size(uint32_t slot_id, int cache_idx) {
@@ -1426,6 +1436,8 @@ static uint32_t nv_current_size(uint32_t slot_id, int cache_idx) {
         size = save_clamp_size((uint32_t)sz);
 
     save_size_cache_store(cache_idx, size);
+    /* Reading zero does not establish that the user truncated the save. */
+    save_zero_authoritative[cache_idx] = 0;
     return size;
 }
 
@@ -1692,6 +1704,41 @@ static long sys_openat(long dirfd, long pathname, long flags, long mode) {
     return -ENOENT;
 }
 
+static long sys_fsync(long fd) {
+    if (fd < FD_FIRST_FREE || fd >= MAX_FDS || !fd_table[fd].in_use)
+        return -EBADF;
+
+    fd_entry_t *f = &fd_table[fd];
+    if (!f->is_save)
+        return -EINVAL;
+
+    /* The slot is shared by all of its descriptors. An older descriptor's
+     * cached size must not truncate a newer write through another one. */
+    uint32_t size = nv_current_size(f->slot_id, f->nv_cache_idx);
+    if (size == 0) {
+        int idx = f->nv_cache_idx;
+        if (idx < 0 || idx >= (int)NV_CACHE_SLOTS)
+            return -EIO;
+        /* A clean reader can expose full CRAM capacity while the launcher
+         * still reports zero. Do not turn that unknown length into a
+         * destructive truncation. Explicit O_TRUNC remains syncable. */
+        if (!save_zero_authoritative[idx])
+            return 0;
+    }
+    if (of_nvslot_flush_size(f->slot_id, size) != 0)
+        return -EIO;
+
+    save_size_cache_store(f->nv_cache_idx, size);
+    for (int i = FD_FIRST_FREE; i < MAX_FDS; i++) {
+        fd_entry_t *other = &fd_table[i];
+        if (other->in_use && other->is_save && other->slot_id == f->slot_id) {
+            other->size = size;
+            other->dirty = 0;
+        }
+    }
+    return 0;
+}
+
 static long sys_close(long fd) {
     if (fd < FD_FIRST_FREE || fd >= MAX_FDS)
         return -EBADF;
@@ -1700,7 +1747,7 @@ static long sys_close(long fd) {
 
     if (fd_table[fd].is_save) {
         fd_entry_t *f = &fd_table[fd];
-        uint32_t save_size = (uint32_t)f->size;
+        uint32_t save_size = nv_current_size(f->slot_id, f->nv_cache_idx);
         int rc = 0;
         if (f->dirty) {
             /* Nonvolatile APF slots are already backed by fixed CRAM0
@@ -2553,6 +2600,8 @@ static long linux_dispatch(long n, long a0, long a1, long a2,
     case SYS_chdir:         return sys_chdir((const char *)a0);
     case SYS_openat:        return sys_openat(a0, a1, a2, a3);
     case SYS_close:         return sys_close(a0);
+    case SYS_fsync:         return sys_fsync(a0);
+    case SYS_fdatasync:     return sys_fsync(a0);
     case SYS_getdents64:    return sys_getdents64((int)a0, (void *)a1, (uint32_t)a2);
     case SYS_lseek:         return sys_llseek(a0, a1, a2, a3, a4);
     case SYS_clock_gettime:           /* legacy 113 — direct callers */

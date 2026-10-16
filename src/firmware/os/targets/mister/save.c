@@ -256,7 +256,7 @@ int of_nvslot_flush_size(uint32_t data_slot_id, uint32_t size) {
      * on the medium.  Make sure the handle is synced and report success. */
     mister_fs_enter();
     FIL *fil = mister_file_open_slot(data_slot_id, 1);
-    int sync_rc = (fil && f_sync(fil) != FR_OK) ? -1 : 0;
+    int sync_rc = (!fil || f_sync(fil) != FR_OK) ? -1 : 0;
     mister_fs_exit();
     return sync_rc;
 }

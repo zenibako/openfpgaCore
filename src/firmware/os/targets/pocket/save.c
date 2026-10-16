@@ -370,6 +370,16 @@ int of_nvslot_flush_size(uint32_t data_slot_id, uint32_t size) {
     if (size > map.capacity)
         size = map.capacity;
 
+    /* fsync runs with interrupts masked. Poll both DMA and its deferred
+     * copy/callback to completion before lending CRAM to the bridge. A
+     * callback may submit more work, so refuse rather than wait forever. */
+    uint32_t start = of_timer_get_ms();
+    while (of_file_async_busy() || !of_file_cram0_quiet()) {
+        if ((uint32_t)(of_timer_get_ms() - start) >= 2000u)
+            return -1;
+        of_file_async_poll();
+    }
+
     uint32_t entry = 0;
     int rc = nvslot_commit_size(data_slot_id, &map, size, &entry);
     if (rc < 0)
@@ -385,16 +395,21 @@ int of_nvslot_flush_size(uint32_t data_slot_id, uint32_t size) {
     {
         uint32_t got = 0xFFFFFFFFu;
         of_timer_delay_us(100);  /* let the commit cross the CDC + arbiter */
-        if (of_file_datatable_word(entry * 2u + 1u, &got) == 0)
+        if (of_file_datatable_word(entry * 2u + 1u, &got) == 0) {
             of_term_printf("[save] slot %u dt[%u] size: want=%u got=%u%s\n",
                            (unsigned)data_slot_id, (unsigned)entry,
                            (unsigned)size, (unsigned)got,
                            got == size ? "" : "  <-- MISMATCH");
-        else
+            if (got != size)
+                return -1;
+        } else {
             of_term_printf("[save] slot %u dt readback FAILED\n",
                            (unsigned)data_slot_id);
+            return -1;
+        }
     }
 
+    uint32_t held = cram0_cpu_hold_count;
     cram0_cpu_hold_count = 0;
     cram0_release_to_bridge();
 
@@ -402,6 +417,12 @@ int of_nvslot_flush_size(uint32_t data_slot_id, uint32_t size) {
     if (chunk == 0 || chunk > map.capacity)
         chunk = map.capacity;
 
-    return of_file_slot_write_chunked(data_slot_id, 0,
-                                      map.bridge_addr, size, chunk);
+    rc = of_file_slot_write_chunked(data_slot_id, 0,
+                                    map.bridge_addr, size, chunk);
+    cram0_cpu_hold_count = held;
+    /* A timeout may leave a host transfer live. Do not steal its mux on
+     * error; the next CPU access must acquire ownership in the usual way. */
+    if (held && rc == 0)
+        cram0_acquire_cpu();
+    return rc;
 }
