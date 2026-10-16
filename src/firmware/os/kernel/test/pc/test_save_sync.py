@@ -13,6 +13,7 @@ import tempfile
 repo = Path(__file__).resolve().parents[6]
 kernel = (repo / 'src/firmware/os/kernel/syscall.c').read_text()
 hal = (repo / 'src/firmware/os/targets/pocket/save.c').read_text()
+mister = (repo / 'src/firmware/os/targets/mister/save.c').read_text()
 if os.environ.get('OF_SAVE_SYNC_BASELINE'):
     revision = os.environ['OF_SAVE_SYNC_BASELINE']
     kernel = subprocess.check_output(['git','show',revision+':src/firmware/os/kernel/syscall.c'],cwd=repo,text=True)
@@ -20,6 +21,8 @@ if os.environ.get('OF_SAVE_SYNC_BASELINE'):
 
 def function(source, marker):
     start = source.index(marker)
+    if source.find(';', start, source.index('{', start)) >= 0:
+        start = source.index(marker, start + len(marker))
     end = source.index('{', start) + 1
     depth = 1
     while depth:
@@ -134,18 +137,24 @@ kernel_pre = r'''
 #define O_ACCMODE 3
 #define O_WRONLY 1
 #define O_APPEND 1024
+#define O_TRUNC 512
+#define FD_KIND_NV_FILE 1
+#define NV_CACHE_SLOTS 1
+#define SAVE_SLOT_SIZE 65536u
 #define FD_FIRST_FREE 3
 #define MAX_FDS 8
 #define SYS_fsync 82
 #define SYS_fdatasync 83
-typedef struct { int in_use,is_save,dirty,nv_cache_idx,flags; uint32_t slot_id; uint64_t size,offset; } fd_entry_t;
+typedef struct { int in_use,is_save,dirty,nv_cache_idx,flags,kind,save_slot; uint32_t slot_id; uint64_t size,offset; } fd_entry_t;
 static fd_entry_t fd_table[MAX_FDS];
 static uint8_t cram[65536],sd[65536];
-static uint32_t latest,stored_size;
+static uint32_t stored_size,metadata_size;
+static uint32_t save_size_cache[NV_CACHE_SLOTS];
+static uint8_t save_size_known[NV_CACHE_SLOTS], save_zero_authoritative[NV_CACHE_SLOTS];
+#define latest save_size_cache[0]
 static unsigned flushes;
 static int fail_flush;
-static uint32_t nv_current_size(uint32_t id,int cache) { assert(id==10&&cache==0);return latest; }
-static void save_size_cache_store(int cache,uint32_t size) { assert(cache==0);latest=size; }
+static long of_file_size(uint32_t id) { assert(id==10);return metadata_size; }
 static int of_nvslot_flush_size(uint32_t id,uint32_t size) {
  assert(id==10 && size<=sizeof(sd)); flushes++;
  if(fail_flush)return -1;
@@ -158,22 +167,28 @@ static uint32_t of_nvslot_capacity(uint32_t id) { assert(id==10);return sizeof(c
 static int of_nvslot_write(uint32_t id,const void *buf,uint32_t off,uint32_t size) {
     assert(id==10 && off+size<=sizeof(cram));memcpy(cram+off,buf,size);return size;
 }
-static int of_nvslot_set_size(uint32_t id,uint32_t size) { assert(id==10);stored_size=size;return 0; }
-static void save_size_cache_invalidate(int idx) { assert(idx==0); }
+static int of_nvslot_set_size(uint32_t id,uint32_t size) { assert(id==10);metadata_size=size;return 0; }
+static void of_save_begin_cpu(void) {}
+static int nv_cache_index_from_data_id(uint32_t id) { return id==10?0:-1; }
+static int of_nvslot_is_supported(uint32_t id) { return id==10; }
+static int save_slot_from_data_id(uint32_t id) { assert(id==10);return 0; }
+static uint32_t nv_infer_text_size(uint32_t id) { (void)id;return 0; }
+static int open_flags_read_only(long flags) { return !(flags & O_ACCMODE); }
 static void of_save_end_cpu(void) {}
 '''
+kernel_pre += ''.join(function(kernel, marker) for marker in ('static uint32_t save_clamp_size(', 'static void save_size_cache_store(', 'static void save_size_cache_invalidate(', 'static uint32_t nv_current_size('))
 if 'static long sys_fsync(' in kernel:
     routine = function(kernel, 'static long sys_fsync(')
     cases = re.search(r'    case SYS_fsync:.*?\n(?:    case SYS_fdatasync:.*?\n)?', kernel).group()
 else:
     routine = ''
     cases = ''
-routine += function(kernel, 'static long sys_write(') + function(kernel, 'static long sys_close(')
+routine += function(kernel, 'static long open_nv_fd(') + function(kernel, 'static long sys_write(') + function(kernel, 'static long sys_close(')
 dispatch = 'static long dispatch(long nr,long a0) { switch(nr) {\n'+cases+'default:return -ENOSYS;}}\n'
 kernel_post = r'''
 int main(void) {
     memset(cram,0x5a,sizeof(cram));memset(sd,0x11,sizeof(sd));
-    latest=63215;
+    save_size_cache_store(0,63215);
     fd_table[3].in_use=fd_table[3].is_save=fd_table[3].dirty=1;
     fd_table[3].slot_id=10;fd_table[3].size=63215;
     fd_table[4]=fd_table[3];fd_table[4].size=63211;
@@ -186,7 +201,7 @@ int main(void) {
     fd_table[5].in_use=1;assert(dispatch(SYS_fsync,5)==-EINVAL);
     fd_table[3].dirty=1;fail_flush=1;
     assert(dispatch(SYS_fsync,3)==-EIO && fd_table[3].dirty);
-    fail_flush=0;latest=100;
+    fail_flush=0;save_size_cache_store(0,100);
     memset(fd_table,0,sizeof(fd_table));
     fd_table[3].in_use=fd_table[3].is_save=1;
     fd_table[3].slot_id=10;fd_table[3].size=100;fd_table[3].flags=O_WRONLY;
@@ -201,20 +216,78 @@ int main(void) {
     assert(sys_write(4,(long)bytes,1)==1 && latest==201 && cram[200]==0x77);
     /* An older dirty descriptor must not shrink a later write on close. */
     fd_table[3].size=100;fd_table[3].dirty=1;
-    assert(sys_close(3)==0 && stored_size==201 && latest==201);
+    assert(sys_close(3)==0 && metadata_size==201 && latest==201);
     /* Shared truncation must win over an older descriptor's size. */
     save_size_cache_store(0,0);fd_table[4].dirty=1;
-    assert(sys_close(4)==0 && stored_size==0 && latest==0);
+    assert(sys_close(4)==0 && metadata_size==0 && latest==0);
+    /* Unknown zero on a clean reader must not truncate populated SD. */
+    memset(fd_table,0,sizeof(fd_table));
+    metadata_size=0;stored_size=63215;save_size_cache_invalidate(0);
+    fd_table[3].in_use=1;
+    assert(open_nv_fd(3,10,0)==3 && fd_table[3].size==sizeof(cram));
+    unsigned before_flush=flushes;
+    assert(dispatch(SYS_fsync,3)==0 && stored_size==63215 && flushes==before_flush);
+    assert(sys_close(3)==0);
+    /* Explicit truncate is authoritative even when its requested size is zero. */
+    fd_table[3]=(fd_entry_t){.in_use=1,.flags=O_WRONLY|O_TRUNC};
+    assert(open_nv_fd(3,10,O_WRONLY|O_TRUNC)==3);
+    fail_flush=1;
+    assert(dispatch(SYS_fsync,3)==-EIO && fd_table[3].dirty);
+    fail_flush=0;
+    assert(dispatch(SYS_fdatasync,3)==0 && stored_size==0 && !fd_table[3].dirty);
+    assert(sys_close(3)==0);
+    /* Explicit empty save must also survive closing before synchronization. */
+    fd_table[3]=(fd_entry_t){.in_use=1,.flags=O_WRONLY|O_TRUNC};
+    assert(open_nv_fd(3,10,O_WRONLY|O_TRUNC)==3 && sys_close(3)==0);
+    fd_table[4]=(fd_entry_t){.in_use=1};
+    assert(open_nv_fd(4,10,0)==4);
+    before_flush=flushes;
+    assert(dispatch(SYS_fsync,4)==0 && stored_size==0 && flushes==before_flush+1);
+    assert(sys_close(4)==0);
+    /* Closing without fsync must not prevent a reopened clean fd from syncing. */
+    fd_table[3]=(fd_entry_t){.in_use=1,.flags=O_WRONLY};
+    assert(open_nv_fd(3,10,O_WRONLY)==3);
+    assert(sys_write(3,(long)bytes,200)==200 && sys_close(3)==0);
+    assert(stored_size==0 && metadata_size==200);
+    fd_table[4]=(fd_entry_t){.in_use=1};
+    assert(open_nv_fd(4,10,0)==4 && !fd_table[4].dirty);
+    assert(dispatch(SYS_fsync,4)==0 && stored_size==200 && !memcmp(cram,sd,200));
     puts("PASS real fsync dispatch: SD survives missing exit writeback, latest shared size, dirty/error handling");
 }
 '''
+mister_pre = r"""
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef struct { int unused; } FIL;
+#define FR_OK 0
+static FIL backing;
+static int mounted=1, sync_rc, commit_rc, locks, opens, syncs;
+static int of_nvslot_set_size(uint32_t id,uint32_t size) { assert(id==10&&size==100);return commit_rc; }
+static void mister_fs_enter(void) { assert(locks==0);locks++; }
+static void mister_fs_exit(void) { assert(locks==1);locks--; }
+static FIL *mister_file_open_slot(uint32_t id,int write) { assert(id==10&&write==1&&locks==1);opens++;return mounted?&backing:0; }
+static int f_sync(FIL *fil) { assert(fil==&backing&&locks==1);syncs++;return sync_rc; }
+"""
+mister_post = r"""
+int main(void) {
+    mounted=0;assert(of_nvslot_flush_size(10,100)<0 && !locks && !syncs);
+    mounted=1;sync_rc=1;assert(of_nvslot_flush_size(10,100)<0 && !locks && syncs==1);
+    sync_rc=0;assert(of_nvslot_flush_size(10,100)==0 && !locks && syncs==2);
+    commit_rc=-1;int before=opens;
+    assert(of_nvslot_flush_size(10,100)<0 && opens==before && !locks);
+    puts("PASS real MiSTer flush: missing backing file, sync failure, success, metadata failure and lock release");
+}
+"""
+
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 env = {**os.environ, 'ASAN_OPTIONS':'detect_leaks=0:halt_on_error=1'}
 failed = False
 with tempfile.TemporaryDirectory(prefix='of-save-sync-') as directory:
     root = Path(directory)
     for name, source in [('hal',hal_pre+function(hal,'int of_nvslot_flush_size(')+hal_post),
-                         ('syscall',kernel_pre+routine+dispatch+kernel_post)]:
+                         ('syscall',kernel_pre+routine+dispatch+kernel_post),
+                         ('mister',mister_pre+function(mister,'int of_nvslot_flush_size(')+mister_post)]:
         path=root/(name+'.c');path.write_text(source)
         subprocess.run(['clang','-std=c11','-Wall','-Wextra','-Wno-unused-function',
                         '-fsanitize=address,undefined',str(path),'-o',str(root/name)],check=True)

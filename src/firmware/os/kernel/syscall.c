@@ -439,6 +439,9 @@ static file_slot_entry_t file_slots[MAX_FILE_SLOTS];
 static int file_slot_count;
 static uint32_t save_size_cache[NV_CACHE_SLOTS];
 static uint8_t save_size_known[NV_CACHE_SLOTS];
+/* A zero read from launcher metadata may hide a populated CRAM archive.
+ * Only an explicit size update (such as O_TRUNC) authorizes flushing zero. */
+static uint8_t save_zero_authoritative[NV_CACHE_SLOTS];
 
 static void save_size_cache_store(int cache_idx, uint32_t size);
 static uint32_t nv_current_size(uint32_t slot_id, int cache_idx);
@@ -1407,6 +1410,7 @@ static void save_size_cache_store(int cache_idx, uint32_t size) {
         return;
     save_size_cache[cache_idx] = save_clamp_size(size);
     save_size_known[cache_idx] = 1;
+    save_zero_authoritative[cache_idx] = (size == 0);
 }
 
 /* Force a re-read from the HAL on the next save_current_size() call.
@@ -1416,6 +1420,7 @@ static void save_size_cache_invalidate(int cache_idx) {
     if (cache_idx < 0 || cache_idx >= (int)NV_CACHE_SLOTS)
         return;
     save_size_known[cache_idx] = 0;
+    save_zero_authoritative[cache_idx] = 0;
 }
 
 static uint32_t nv_current_size(uint32_t slot_id, int cache_idx) {
@@ -1431,6 +1436,8 @@ static uint32_t nv_current_size(uint32_t slot_id, int cache_idx) {
         size = save_clamp_size((uint32_t)sz);
 
     save_size_cache_store(cache_idx, size);
+    /* Reading zero does not establish that the user truncated the save. */
+    save_zero_authoritative[cache_idx] = 0;
     return size;
 }
 
@@ -1708,6 +1715,16 @@ static long sys_fsync(long fd) {
     /* The slot is shared by all of its descriptors. An older descriptor's
      * cached size must not truncate a newer write through another one. */
     uint32_t size = nv_current_size(f->slot_id, f->nv_cache_idx);
+    if (size == 0) {
+        int idx = f->nv_cache_idx;
+        if (idx < 0 || idx >= (int)NV_CACHE_SLOTS)
+            return -EIO;
+        /* A clean reader can expose full CRAM capacity while the launcher
+         * still reports zero. Do not turn that unknown length into a
+         * destructive truncation. Explicit O_TRUNC remains syncable. */
+        if (!save_zero_authoritative[idx])
+            return 0;
+    }
     if (of_nvslot_flush_size(f->slot_id, size) != 0)
         return -EIO;
 
