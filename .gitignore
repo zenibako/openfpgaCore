@@ -107,6 +107,10 @@ tools/.vexii-home/
 .vscode/
 .idea/
 .claude/
+# Expose only the shared skill-directory bridge; keep local Claude state private.
+!/.claude/
+/.claude/*
+!/.claude/skills
 
 # Python
 .venv/
