@@ -33,6 +33,10 @@ make sdk DEST=<sdk checkout> # copy headers and runtime into an SDK checkout
 `make use-mister` or `make use-os30` sets a sticky default; `make` lists all
 goals.
 
+For consumer-specific platform selection and shared device benchmark evidence,
+use [BENCHMARKING.md](BENCHMARKING.md). It routes profiles, coverage and the three
+comparison modes through pocket-harness while retaining native hardware gates.
+
 ## Save states (Pocket)
 
 Pocket sleep/wake and Memories are one feature, switched per core by
