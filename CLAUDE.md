@@ -3,7 +3,11 @@
 For project-specific Pocket profile selection and benchmark evidence, use
 [BENCHMARKING.md](BENCHMARKING.md) and the local
 [pocket-benchmarking skill](.agents/skills/pocket-benchmarking/SKILL.md).
-The shared collector supplements the native hardware and release gates below.
+For [routine regression checks](BENCHMARKING.md#routine-regression-checks),
+preserve accepted source/artifact/test evidence and build independent candidates.
+Keep affected native RTL/acceptance suites and hardware gates; Butterscotch's
+`regression.py` is not an OS regression runner. The shared collector supplements
+the native hardware and release gates below.
 
 Operating system + RISC-V SoC for the **Analogue Pocket** (and MiSTer) FPGA. This file is the
 practical build/sweep/deploy reference for agents and contributors. Commands assume the local

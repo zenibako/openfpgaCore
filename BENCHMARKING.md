@@ -2,11 +2,50 @@
 
 Use [README.md](README.md) and [CLAUDE.md](CLAUDE.md) for build, timing, firmware
 and hardware checks. Use the separate
-[pocket-harness](https://github.com/zenibako/pocket-harness) checkout for shared
-profile identities and comparable consumer/device measurements. The repository
-is private; contributors need access and an established local checkout.
-The [local skill](.agents/skills/pocket-benchmarking/SKILL.md) locates and validates
-its canonical workflow. Set `POCKET_HARNESS_ROOT` to that checkout as needed.
+[pocket-dev-tools](https://github.com/zenibako/pocket-dev-tools) checkout
+(formerly `pocket-harness`) for shared profile identities and comparable
+consumer/device measurements. Contributors need access and an established local
+checkout. The [local skill](.agents/skills/pocket-benchmarking/SKILL.md) locates and
+validates its canonical workflow: explicit session root, `POCKET_DEV_TOOLS_ROOT`,
+then legacy `POCKET_HARNESS_ROOT`, with conflicting explicit roots resolved first.
+
+## Routine regression checks
+
+Use the [shared preserved-baseline contract](https://github.com/zenibako/pocket-dev-tools/blob/fd5fc7af6cb51b19bb800d6c2cd43b7c03cfcf58/benchmarks/REGRESSIONS.md)
+(introduced in shared commit `fd5fc7af6cb51b19bb800d6c2cd43b7c03cfcf58`) from the verified
+`pocket-dev-tools` checkout. Require its `benchmarks/REGRESSIONS.md` and record the
+actual shared commit; do not silently substitute an older checkout. Keep private
+source exports, accepted evidence, indices and candidate/failure records under
+that checkout's ignored directories. Do not ship them in this project's releases.
+
+For a routine OS/RTL change, preserve an accepted source/toolchain/configuration
+and its native test evidence; build each candidate independently in the native
+isolated job directories. Bind the netlist/MIF, firmware/OS, bitstream/loader,
+CPU/variant macros, compiler flags, target/clock, fitter seed and fit/STA results
+to the exact source revisions and artifact hashes. Do not overwrite the reference
+or modify pins/seeds merely to make a comparison eligible.
+
+Run the affected native RTL and byte-exact acceptance suites named in
+[the workflow guide](CLAUDE.md#tests-verilator). `make test` is only its regression
+set; it does not run every GPU/scanout/CRAM/system suite. Preserve applicable
+negative tests, complete pass/fail logs and known pre-existing failures. Record
+private baseline paths/digests and retain candidates and failed evidence under
+new names. A source, compiler or platform-configuration change is a separately
+recorded experiment with explicit differences and an accepted reference.
+
+Shared `regression.py` verifies supported Butterscotch frames; it is not an OS or
+generic consumer regression runner. Existing native RTL, hardware-contract,
+firmware pairing, fit/hold/DQ/STA, boot-memory and physical acceptance remain
+required. Test a known bad change against the relevant native oracle rather
+than treating a consumer's self-consistent replay as OS qualification.
+
+Consumer benchmark bundles supplement those checks. `verify` establishes archive
+integrity and `compare` reports compatible numeric deltas, without rerunning OS
+or game correctness or enforcing an automatic slowdown threshold. Keep host,
+simulated and device domains distinct. Controlled platform mode still requires
+the same ELF/toolchain; rebuilt ELFs use declared whole-configuration comparison.
+The shared workload's pinned model does not validate new production gateware,
+SD behavior, audio, Memories or sleep/wake; preserve each affected device gate.
 
 ## Select candidates and record actual builds
 
