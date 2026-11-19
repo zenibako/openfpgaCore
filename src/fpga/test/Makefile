@@ -97,6 +97,7 @@ GPU_SRCS = \
 	tb_gpu.v \
 	altsyncram_stub.v \
 	$(COMMON_DIR)/gpu_core.v \
+	$(COMMON_DIR)/gpu_geometry_worker.v \
 	$(COMMON_DIR)/gpu_edge_walker.v \
 	$(COMMON_DIR)/gpu_tex_cache.v
 
@@ -487,6 +488,9 @@ $(GPU_CB_SCAN_DIR)/V$(SCANOUT_RACE_TOP): $(SCANOUT_RACE_SRCS) $(SCANOUT_RACE_CPP
 
 # Pocket model: out_height = app-native (200) — lower scanout bandwidth, the
 # source buffer is freed faster, so the GPU should never overtake the reader.
+# FETCH_CHUNK_WORDS=40 matches core_top's scanout instance (line fetch split
+# into sub-bursts so word ops interleave), so this is the bench that covers
+# the chunked fetch path against the real io_sdram.
 scanout-race-pocket: $(SCANOUT_RACE_POCKET_DIR)/V$(SCANOUT_RACE_TOP)
 	@printf "\n=== SCANOUT vs GPU read-during-write race (Pocket: out 640x200) ===\n"
 	@printf "\n--- REAL GPU-triggered flip path (Pocket scanout bandwidth) ---\n"
@@ -497,6 +501,7 @@ scanout-race-pocket: $(SCANOUT_RACE_POCKET_DIR)/V$(SCANOUT_RACE_TOP)
 $(SCANOUT_RACE_POCKET_DIR)/V$(SCANOUT_RACE_TOP): $(SCANOUT_RACE_SRCS) $(SCANOUT_RACE_CPP)
 	$(VERILATOR) $(VERILATOR_FLAGS_NOTRACE) $(SCANOUT_RACE_FLAGS) \
 		-GOUT_HEIGHT=200 \
+		-GFETCH_CHUNK_WORDS=40 \
 		--top-module $(SCANOUT_RACE_TOP) --Mdir $(SCANOUT_RACE_POCKET_DIR) \
 		-I$(COMMON_DIR) \
 		$(SCANOUT_RACE_SRCS) $(SCANOUT_RACE_CPP)
@@ -1073,7 +1078,10 @@ gpu-acceptance-os30-exact: $(GPU_ACCEPT_OS30X_DIR)/V$(GPU_TOP)
 	./$(GPU_ACCEPT_OS30X_DIR)/V$(GPU_TOP)
 
 # Independent analytic coverage: pixel centers and watertight shared edges.
-.PHONY: gpu-edge-coverage
+.PHONY: gpu-edge-coverage gpu-edge-range
+gpu-edge-range:
+	python3 ../../../tools/check_gpu_edge_range.py
+
 gpu-edge-coverage:
 	$(VERILATOR) --cc --exe --build -j 4 -Wno-fatal --top-module gpu_edge_walker \
 		--Mdir obj_dir_edge_coverage $(COMMON_DIR)/gpu_edge_walker.v tb_gpu_edge_coverage.cpp
@@ -1242,7 +1250,7 @@ gpu-perf: $(GPU_PERF_DIR)/V$(GPU_TOP)
 	./$(GPU_PERF_DIR)/V$(GPU_TOP) $(GPU_PERF_ARGS)
 
 # Exact Pocket os25 GPU configuration, shared by correctness and throughput tests.
-GPU_OS25_FLAGS = +define+INCLUDE_TRANSLUC \
+GPU_OS25_FLAGS = +define+INCLUDE_TRANSLUC +define+INCLUDE_SPAN_DEDICATED_MULT \
     -GINCLUDE_CPU_RING=1 -GINCLUDE_COMMAND_DMA=0 \
     -GGPU_WRITE_COMBINE_FAST_FLUSH=1 -GGPU_WRITE_GATHER=1 -GGPU_MASKED_WRITE_BURSTS=1 \
     -GINCLUDE_COMPACT_SPAN=1 -GINCLUDE_COLUMN_LIST=1 -GGPU_EW_PARALLEL_DIVS=0 \
@@ -1268,7 +1276,7 @@ $(GPU_PERF_POCKET_DIR)/V$(GPU_TOP): $(GPU_SRCS) $(GPU_PERF_CPP) Makefile
 
 $(GPU_ACCEPT_OS25X_DIR)/V$(GPU_TOP): $(GPU_SRCS) $(GPU_ACCEPT_CPP) Makefile
 	$(VERILATOR) $(VERILATOR_FLAGS) \
-		-CFLAGS "-std=c++17 -O2 -DGPU_TEST_NO_PARAM_TRI -DGPU_TEST_NO_VERT_TRI -DGPU_TEST_NO_COMMAND_DMA" \
+		-CFLAGS "-std=c++17 -O2 -DGPU_TEST_NO_PARAM_TRI -DGPU_TEST_NO_VERT_TRI -DGPU_TEST_NO_COMMAND_DMA -DGPU_TEST_TRANSLUC" \
 		$(GPU_OS25_FLAGS) \
 		--top-module $(GPU_TOP) --Mdir $(GPU_ACCEPT_OS25X_DIR) -I$(COMMON_DIR) \
 		$(GPU_SRCS) $(GPU_ACCEPT_CPP)
@@ -1401,6 +1409,31 @@ $(GPU_CRAM1_DIR)/Vtb_gpu: $(GPU_CRAM1_SRCS) $(GPU_CRAM1_CPP)
 axi-periph: $(AXI_PERIPH_DIR)/V$(AXI_PERIPH_TOP)
 	@printf "\n=== AXI periph slave ===\n"
 	./$(AXI_PERIPH_DIR)/V$(AXI_PERIPH_TOP)
+
+# Exercise the os20 perspective/depth capability cuts through actual MMIO.
+.PHONY: axi-periph-affine
+axi-periph-affine: obj_dir_axi_periph_affine/V$(AXI_PERIPH_TOP)
+	./obj_dir_axi_periph_affine/V$(AXI_PERIPH_TOP)
+
+obj_dir_axi_periph_affine/V$(AXI_PERIPH_TOP): $(AXI_PERIPH_SRCS) $(AXI_PERIPH_CPP)
+	$(VERILATOR) $(VERILATOR_FLAGS) $(AXI_PERIPH_FLAGS) \
+		+define+INCLUDE_ANALOGIZER +define+INCLUDE_LINK \
+		-GINCLUDE_PERSPECTIVE=0 -GINCLUDE_DEPTH=0 \
+		-CFLAGS "-DGPU_TEST_NO_PERSPECTIVE -DGPU_TEST_NO_DEPTH" \
+		--top-module $(AXI_PERIPH_TOP) --Mdir obj_dir_axi_periph_affine \
+		-I$(COMMON_DIR) $(AXI_PERIPH_SRCS) $(AXI_PERIPH_CPP)
+
+# os30's triangle GPU keeps perspective/depth but omits long-form span lists.
+.PHONY: axi-periph-triangles
+axi-periph-triangles: obj_dir_axi_periph_triangles/V$(AXI_PERIPH_TOP)
+	./obj_dir_axi_periph_triangles/V$(AXI_PERIPH_TOP)
+
+obj_dir_axi_periph_triangles/V$(AXI_PERIPH_TOP): $(AXI_PERIPH_SRCS) $(AXI_PERIPH_CPP)
+	$(VERILATOR) $(VERILATOR_FLAGS) $(AXI_PERIPH_FLAGS) \
+		+define+INCLUDE_ANALOGIZER +define+INCLUDE_LINK \
+		-GINCLUDE_PARAM_SPAN_LIST=0 -CFLAGS "-DGPU_TEST_NO_PARAM_SPAN_LIST" \
+		--top-module $(AXI_PERIPH_TOP) --Mdir obj_dir_axi_periph_triangles \
+		-I$(COMMON_DIR) $(AXI_PERIPH_SRCS) $(AXI_PERIPH_CPP)
 
 .PHONY: axi-periph-mister
 axi-periph-mister: obj_dir_axi_periph_mister/V$(AXI_PERIPH_TOP)
@@ -1708,7 +1741,7 @@ clean:
 	rm -rf $(SDRAM_DIR) $(SDRAM_SERIAL_DIR) $(SDRAM_NATIVE2_DIR) $(SRAM_DIR) $(GPU_DIR) $(GPU_FLOOR_DIR) \
 	       $(GPU_GPUDEMO_DIR) $(GPU_ACCEPT_DIR) $(GPU_ACCEPT_SINGLE_DIR) \
 	       $(GPU_ACCEPT_OS30_DIR) $(GPU_ACCEPT_ZRAW_DIR) $(SCANOUT_LEAN_DIR) \
-	       $(AXI_PERIPH_DIR) \
+	       $(AXI_PERIPH_DIR) obj_dir_axi_periph_affine obj_dir_axi_periph_triangles \
 	       $(AUDIO_DIR) $(MIXER_DIR) $(MIXER_MISTER_DIR) $(SYSTEM_DIR) \
 	       $(ARBITER_DIR) \
 	       obj_dir_gpu obj_dir_gpu_floor obj_dir_gpu_gpudemo \

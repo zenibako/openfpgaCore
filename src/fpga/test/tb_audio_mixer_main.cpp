@@ -47,6 +47,9 @@ static Vtb_audio_mixer *dut;
 static vluint64_t        sim_time;
 static int               passes;
 static int               fails;
+static bool report_perf = std::getenv("AUDIO_PERF_REPORT") != nullptr;
+static uint64_t sample_trace = 14695981039346656037ull;
+static unsigned sample_count = 0;
 
 static void tick(int n = 1) {
     for (int i = 0; i < n; i++) {
@@ -56,6 +59,11 @@ static void tick(int n = 1) {
         dut->clk = 1;
         dut->eval();
         sim_time++;
+        if (report_perf && dut->sample_wr) {
+            sample_trace = (sample_trace ^ sim_time) * 1099511628211ull;
+            sample_trace = (sample_trace ^ dut->sample_data) * 1099511628211ull;
+            ++sample_count;
+        }
     }
 }
 
@@ -121,14 +129,14 @@ static void mmio_voice_write(int voice, int field, uint32_t data) {
 }
 
 // Backdoor read. audio_mixer.v keeps the MMIO-visible 16-field voice
-// layout in two packed tables: CPU-owned fields and FSM-owned fields.
+// layout at MMIO; the FSM-owned backing table uses a four-word stride.
 static uint32_t vtbl_read(int voice, int field) {
     int addr = (voice << 4) | field;
     switch (field) {
     case VTBL_POS_INT:
     case VTBL_POS_FRAC:
     case VTBL_VOL_LR:
-        return dut->rootp->tb_audio_mixer->dut__DOT__vtbl_fsm_mem[addr];
+        return dut->rootp->tb_audio_mixer->dut__DOT__vtbl_fsm_mem[(voice << 2) | (field & 3)];
     case VTBL_ADDR:
     case VTBL_LEN:
     case VTBL_RATE:
@@ -220,6 +228,25 @@ static void test_flat_mmio_independence(void) {
     mmio_voice_write(15, VTBL_VOL_TARGET, 0x5678);
     check_eq_u32("voice  7 VOL_TARGET", vtbl_read(7,  VTBL_VOL_TARGET), 0x1234);
     check_eq_u32("voice 15 VOL_TARGET", vtbl_read(15, VTBL_VOL_TARGET), 0x5678);
+}
+
+// Exercise every voice through MMIO so compact mutable-table addressing
+// cannot alias neighboring voices or POS_INT and VOL_LR. Voices stay inactive;
+// queued start-state writes must drain without the sample FSM changing them.
+static void test_mutable_fields_all_voices(void) {
+    printf("test_mutable_fields_all_voices:\n");
+    reset_dut();
+    for (int voice = 0; voice < 32; ++voice) {
+        mmio_voice_write(voice, VTBL_CTRL, 0);
+        mmio_voice_write(voice, VTBL_POS_INT, 0x200000u + voice * 257u);
+        mmio_voice_write(voice, VTBL_VOL_LR, 0x8000u + voice * 131u);
+    }
+    tick(2000);
+    bool intact = true;
+    for (int voice = 0; voice < 32; ++voice)
+        intact &= vtbl_read(voice, VTBL_POS_INT) == 0x200000u + voice * 257u
+               && vtbl_read(voice, VTBL_VOL_LR) == 0x8000u + voice * 131u;
+    check(intact, "all 32 voices retain independent mutable fields");
 }
 
 // ---------------------------------------------------------------------
@@ -432,14 +459,14 @@ static void test_explicit_lr_targets(void) {
     uint32_t center = wait_for_sample(3, "center sample emitted");
     int center_l = (int16_t)(center >> 16);
     int center_r = (int16_t)(center & 0xFFFF);
-    check_in_range("center L", center_l, 900, 1100);
-    check_in_range("center R", center_r, 900, 1100);
+    check_in_range("center L", center_l, 3600, 4400);
+    check_in_range("center R", center_r, 3600, 4400);
 
     program_constant_looped_voice(2, 0x00FF);    // L=255, R=0
     uint32_t left = wait_for_sample(3, "hard-left sample emitted");
     int left_l = (int16_t)(left >> 16);
     int left_r = (int16_t)(left & 0xFFFF);
-    check_in_range("hard-left L", left_l, 900, 1100);
+    check_in_range("hard-left L", left_l, 3600, 4400);
     check(abs_i16(left_r) <= 2, "hard-left R muted");
 
     program_constant_looped_voice(2, 0xFF00);    // L=0, R=255
@@ -447,13 +474,13 @@ static void test_explicit_lr_targets(void) {
     int right_l = (int16_t)(right >> 16);
     int right_r = (int16_t)(right & 0xFFFF);
     check(abs_i16(right_l) <= 2, "hard-right L muted");
-    check_in_range("hard-right R", right_r, 900, 1100);
+    check_in_range("hard-right R", right_r, 3600, 4400);
 
     program_zero_then_post_target_voice(2, 0x00FF);     // Duke 3D sequence
     uint32_t post = wait_for_sample(40, "post-start set_vol_lr sample emitted");
     int post_l = (int16_t)(post >> 16);
     int post_r = (int16_t)(post & 0xFFFF);
-    check_in_range("post-start hard-left L", post_l, 900, 1100);
+    check_in_range("post-start hard-left L", post_l, 3600, 4400);
     check(abs_i16(post_r) <= 2, "post-start hard-left R muted");
 }
 
@@ -498,8 +525,8 @@ static void sdram_fill_range(int lo, int hi, uint32_t word) {
 
 // Test 6: the centerpiece — starve → fade → hold → resume, with the
 // unwritten ring region poisoned at full scale.  Constant +4096 input
-// at full volume mixes to ~255 per channel (accum >>> 4); poison would
-// show up around ~2040.  The max_araddr_seen monitor is the strict
+// at full volume mixes to ~1020 per channel (accum >>> 2); poison would
+// show up around ~8160.  The max_araddr_seen monitor is the strict
 // "never fetched past WPTR" assertion.
 static void test_stream_hold_resume(void) {
     printf("test_stream_hold_resume:\n");
@@ -527,7 +554,7 @@ static void test_stream_hold_resume(void) {
     // Phase 1: play through the written region into the hold.
     // 512 pairs at rate 1.0 = ~512 samples; run 600 to be past it.
     int mag_play = run_samples(300);
-    check_in_range("stream plays written region (post ramp-in mag)", mag_play, 150, 400);
+    check_in_range("stream plays written region (post ramp-in mag)", mag_play, 600, 1600);
 
     run_samples(300);                       // walk the rest + fade + hold
     uint32_t held = read_pos(V);
@@ -549,7 +576,7 @@ static void test_stream_hold_resume(void) {
     mmio_voice_write(V, VTBL_WPTR, 1020);
 
     int mag_resumed = run_samples(400);
-    check_in_range("auto-resume after WPTR advance (mag)", mag_resumed, 150, 400);
+    check_in_range("auto-resume after WPTR advance (mag)", mag_resumed, 600, 1600);
     run_samples(300);
     uint32_t held3 = read_pos(V);
     check_in_range("re-held just below new WPTR", (int)held3, 1014, 1019);
@@ -563,7 +590,7 @@ static void test_stream_hold_resume(void) {
     mmio_voice_write(V, VTBL_WPTR, 400);
 
     int mag_wrap = run_samples(300);
-    check_in_range("plays across ring seam after wrapped WPTR (mag)", mag_wrap, 150, 400);
+    check_in_range("plays across ring seam after wrapped WPTR (mag)", mag_wrap, 600, 1600);
     run_samples(300);
     uint32_t held4 = read_pos(V);
     check_in_range("held below wrapped WPTR", (int)held4, 394, 399);
@@ -600,7 +627,7 @@ static void test_stream_empty_and_full(void) {
     sdram_fill_range(0, 1023, 0x10001000);
     mmio_voice_write(V, VTBL_WPTR, 1023);
     int mag_full = run_samples(400);
-    check_in_range("full ring plays without spurious hold (mag)", mag_full, 150, 400);
+    check_in_range("full ring plays without spurious hold (mag)", mag_full, 600, 1600);
     uint32_t pos_full = read_pos(V);
     check(pos_full > 200, "full-ring position advances freely");
 }
@@ -670,7 +697,7 @@ static void test_stream_max_rate(void) {
     mmio_voice_write(V, VTBL_CTRL, CTRL_ACTIVE | CTRL_STEREO | CTRL_LOOP | CTRL_STREAM);
 
     int mag = run_samples(200);
-    check_in_range("rate-2.0 stream plays written region (mag)", mag, 150, 400);
+    check_in_range("rate-2.0 stream plays written region (mag)", mag, 600, 1600);
     run_samples(200);                       // walk into the hold
     uint32_t held = read_pos(V);
     check_in_range("rate-2.0 held just below WPTR", (int)held, 504, 511);
@@ -680,7 +707,7 @@ static void test_stream_max_rate(void) {
     sdram_fill_range(512, 1020, 0x10001000);
     mmio_voice_write(V, VTBL_WPTR, 1020);
     int mag2 = run_samples(300);
-    check_in_range("rate-2.0 auto-resume (mag)", mag2, 150, 400);
+    check_in_range("rate-2.0 auto-resume (mag)", mag2, 600, 1600);
     check(dut->max_araddr_seen < 1020 * 4,
           "rate-2.0 still never fetched past WPTR after resume");
 }
@@ -708,7 +735,7 @@ static void test_legacy_loop_ignores_wptr(void) {
     mmio_voice_write(V, VTBL_CTRL, CTRL_ACTIVE | CTRL_LOOP);   // mono, NO stream
 
     int mag = run_samples(600);
-    check_in_range("legacy loop voice plays past a stale WPTR (mag)", mag, 150, 400);
+    check_in_range("legacy loop voice plays past a stale WPTR (mag)", mag, 600, 1600);
     check((dut->voice_active_mask & (1u << V)) != 0, "legacy loop voice still active");
     // It must have looped (pos wrapped at 256), i.e. fetched well past
     // WPTR=8 — replay-on-wrap is the legacy contract.
@@ -1022,6 +1049,10 @@ int main(int argc, char **argv) {
     test_rearm_during_sample();
     test_rearm_phase_sweep();
     test_mister_paced_mixer();
+    test_mutable_fields_all_voices();
+    // Compare both PCM values and their exact emission cycles across builds.
+    if (report_perf) printf("PERF audio samples %u trace %016llx\n", sample_count,
+                            (unsigned long long)sample_trace);
 
     printf("\n=== Results: %d passed, %d failed ===\n", passes, fails);
 
