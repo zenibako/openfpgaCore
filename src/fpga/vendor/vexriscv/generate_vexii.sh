@@ -178,6 +178,9 @@ if [ "$OS30_RVC_PIPELINE" = 1 ]; then
     (set -o pipefail; tar --exclude=.git --exclude=target --exclude='VexiiRiscv*.v' \
         --exclude=vexii_active.v -cf - . | tar -xf - -C "$GENERATION_DIR")
     cd "$GENERATION_DIR"
+    # The copy has no .git; keep git from finding the enclosing checkout,
+    # whose .git may be unreachable (worktree inside the Docker container).
+    export GIT_CEILING_DIRECTORIES="$SCRIPT_DIR"
     sha256sum -c <<'OS30_SOURCE_BEFORE'
 868df74562a7d566a56ee5f3f4fbfb976978279c37b686b610cb1915ff7af9a6  src/main/scala/vexiiriscv/Param.scala
 f4caaf7bb9f885ac252ca32cd751a9394076d26da789ebf324af9ea946626460  src/main/scala/vexiiriscv/decode/AlignerPlugin.scala
@@ -201,6 +204,9 @@ if [ "$OS20_LSU_DISPATCH" = 1 ]; then
     (set -o pipefail; tar --exclude=.git --exclude=target --exclude='VexiiRiscv*.v' \
         --exclude=vexii_active.v -cf - . | tar -xf - -C "$GENERATION_DIR")
     cd "$GENERATION_DIR"
+    # The copy has no .git; keep git from finding the enclosing checkout,
+    # whose .git may be unreachable (worktree inside the Docker container).
+    export GIT_CEILING_DIRECTORIES="$SCRIPT_DIR"
     sha256sum -c <<'OS20_SOURCE_BEFORE'
 de0ca41f2905bcfb80b030b208ca29c9ff9d4a3fbb8846ca3f0c35afc7c249c4  src/main/scala/vexiiriscv/schedule/DispatchPlugin.scala
 2f29a2fdcd8983cdf94d6bf3da5620bdfaa8d8d10cca42e7293c8539f35f6622  src/main/scala/vexiiriscv/execute/lsu/LsuPlugin.scala
