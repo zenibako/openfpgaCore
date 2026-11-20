@@ -21,16 +21,28 @@ netlist_hash() {
         # firmware rebuild changes what the fitter places even when every .v is
         # byte-identical.  Leaving it out once let an os30 sweep fail 12/12
         # against an unchanged RTL fingerprint.
+        # Quartus rewrites the qsf during a compile and adds a qsf-relative
+        # entry for every absolute one, so the same sources appear once before
+        # the fit and twice after.  Resolve each entry to one physical path
+        # (relative entries against the qsf's directory, as Quartus does) and
+        # count each file once.  Otherwise a fresh bld/<job>/ hashed
+        # differently from the post-fit qsf that sweep.sh records.
         grep -E "(SYSTEM)?VERILOG_FILE|QIP_FILE|MIF_FILE" "$qsf" \
         | awk '{print $NF}' \
         | while read -r f; do
+            case "$f" in
+                /*) p="$f" ;;
+                *)  p="$(dirname "$qsf")/$f"; [ -f "$p" ] || p="$f" ;;
+            esac
+            [ -f "$p" ] || continue
+            printf '%s/%s\n' "$(cd "$(dirname "$p")" && pwd -P)" "$(basename "$p")"
+          done | sort -u \
+        | while read -r p; do
             # Hash CONTENT only: md5sum <file> would include the path, which
             # carries the per-seed build dir, so the same netlist hashed
             # differently from bld/<v>-s<best>/ and bld/<v>/ and the staleness
             # warning fired on every build.
-            if [ -f "$f" ]; then md5sum < "$f"
-            elif [ -f "$(dirname "$qsf")/$f" ]; then md5sum < "$(dirname "$qsf")/$f"
-            fi
+            md5sum < "$p"
           done | sort
         for f in "$@"; do
             if [ -f "$f" ]; then md5sum < "$f"
