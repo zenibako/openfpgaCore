@@ -72,6 +72,39 @@ class TimingTests(unittest.TestCase):
             variant.write_text("DEFS := INCLUDE_HW_MIXER INCLUDE_CLK_AUTOTUNE\n")
             self.assertNotEqual(fingerprint(), dated)
 
+    def test_fingerprint_ignores_quartus_relative_duplicates(self):
+        # Quartus adds a qsf-relative entry for each absolute one during a
+        # compile; the generated (pre-fit) and rewritten (post-fit) qsf must
+        # fingerprint the same, and the hash must not depend on the cwd.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "rtl" / "core.v"
+            mif = root / "boot.mif"
+            source.parent.mkdir()
+            source.write_text("module core; endmodule\n")
+            mif.write_text("WIDTH=32;\n")
+            job = root / "bld" / "job"
+            job.mkdir(parents=True)
+            qsf = job / "ap_core.qsf"
+            entries = (f"set_global_assignment -name VERILOG_MACRO INCLUDE_X\n"
+                       f"set_global_assignment -name VERILOG_FILE {source}\n"
+                       f"set_global_assignment -name MIF_FILE {mif}\n")
+
+            def fingerprint(cwd):
+                return subprocess.check_output(
+                    ["bash", "-c", '. "$1"; shift; netlist_hash "$@"', "test",
+                     str(TOOLS / "netlist_hash.sh"), str(qsf)], cwd=cwd)
+
+            qsf.write_text(entries)
+            generated = fingerprint(root)
+            qsf.write_text(entries
+                           + "set_global_assignment -name VERILOG_FILE ../../rtl/core.v\n"
+                           + "set_global_assignment -name MIF_FILE ../../boot.mif\n")
+            self.assertEqual(fingerprint(root), generated)
+            self.assertEqual(fingerprint(job), generated)
+            source.write_text("module core(input a); endmodule\n")
+            self.assertNotEqual(fingerprint(root), generated)
+
     def sweep(self, scenario):
         with tempfile.TemporaryDirectory() as directory:
             job = Path(directory)
