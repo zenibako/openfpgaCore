@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Run GPU acceptance with parameters extracted from every target/variant.
+"""Run common-source GPU acceptance with target/variant feature parameters.
 
-Preprocesses the production top level using its Make-resolved feature macros.
-This avoids hand-maintained copies silently diverging from the shipped GPU.
+Preprocesses the common top level using its Make-resolved feature macros.
 Uses the existing pixel oracles and disabled-command drain tests, with low and
 variable memory latency. Fast texture memory has separate controller tests.
+
+This legacy fixture does not resolve variants/*.sources. Its os30 result covers
+common/gpu_core.v, not the selected common/os30 snapshot. Selected os30 source
+closure is qualified separately by the frozen campaign's check action in
+tools/experiments/os30_fps25_20261005/phase10_normal_build_endpoint_control.py;
+that archived qualification is not a live-tree or full-core timing check.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -84,13 +89,26 @@ def main():
         defaults = dict((name, int(value)) for name, value in
                         re.findall(r'parameter\s+(\w+)\s*=\s*(\d+)\s*[,\n]', core_params))
         defaults.update(params)
+        periph = re.search(r'axi_periph_slave\s*#\((.*?)\)\s*\w+\s*\(', pre.stdout, re.S)
+        if not periph:
+            raise ValueError('Peripheral instance not found in ' + variant)
+        periph_params = dict((name, int(value)) for name, value in
+                             re.findall(r'\.(\w+)\(\s*(\d+)\s*\)', periph[1]))
+        for name in ('INCLUDE_PERSPECTIVE', 'INCLUDE_DEPTH', 'INCLUDE_PARAM_SPAN_LIST'):
+            if periph_params.get(name, 1) != defaults[name]:
+                raise ValueError(f'{variant}: GPU and HW_FEATURES disagree on {name}')
         fixture = (test / 'tb_gpu.v').read_text()
         forwarded = re.findall(r'parameter\s+(\w+)\s*=', fixture[:fixture.index('input  wire')])
         flags = ['-G' + name + '=' + str(defaults[name]) for name in forwarded]
         cflags = ['-std=c++17', '-O2']
+        if 'INCLUDE_TRANSLUC' in row['defs'].split():
+            cflags += ['-DGPU_TEST_TRANSLUC']
         if not defaults['INCLUDE_COMPACT_SPAN'] and not defaults['INCLUDE_COLUMN_LIST']:
             cflags += ['-DGPU_TEST_OS30_LEAN']
         gates = [('INCLUDE_DIRECT_COLOR', 'GPU_TEST_TRUECOLOR', True),
+                 ('INCLUDE_PERSPECTIVE', 'GPU_TEST_NO_PERSPECTIVE', False),
+                 ('INCLUDE_DEPTH', 'GPU_TEST_NO_DEPTH', False),
+                 ('INCLUDE_PARAM_SPAN_LIST', 'GPU_TEST_NO_PARAM_SPAN_LIST', False),
                  ('INCLUDE_XFORM_RGB', 'GPU_TEST_XFORM', True),
                  ('INCLUDE_PARAM_TRI', 'GPU_TEST_NO_PARAM_TRI', False),
                  ('INCLUDE_VERT_TRI', 'GPU_TEST_NO_VERT_TRI', False),
@@ -102,7 +120,11 @@ def main():
         for feature, define, enabled in gates:
             if bool(defaults[feature]) == enabled:
                 cflags.append('-D' + define)
-        sources = [test / 'tb_gpu.v', common / 'gpu_core.v', common / 'gpu_edge_walker.v',
+        if 'INCLUDE_GPU_SM64_GEOMETRY' in row['defs'].split():
+            # The specialized raw-vertex frontend replaces the legacy matrix
+            # opcodes, while retaining its internal MAC datapath.
+            cflags += ['-DGPU_TEST_NO_MAC', '-DGPU_TEST_GEOMETRY']
+        sources = [test / 'tb_gpu.v', common / 'gpu_core.v', common / 'gpu_geometry_worker.v', common / 'gpu_edge_walker.v',
                    common / 'gpu_tex_cache.v', common / 'gpu_color_depth_cache.sv',
                    test / 'tb_gpu_acceptance_main.cpp']
         manifest = dict(variant=row, parameters=defaults, flags=flags, cflags=cflags,
@@ -116,8 +138,15 @@ def main():
         with (dest / 'build.log').open('w') as log:
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
         result = {}
-        for label, plus in [('quiet', []), ('delayed', ['+gpu_rd_latency=24',
-                            '+gpu_rd_latency_var=1', '+gpu_wr_latency=17'])]:
+        scenarios = [('quiet', []), ('delayed', ['+gpu_rd_latency=24',
+                      '+gpu_rd_latency_var=1', '+gpu_wr_latency=17'])]
+        if 'INCLUDE_Z_EARLY_RESTART' in row['defs'].split():
+            # Restarted pixels must remain coherent while later fill beats
+            # pause, and command completion must wait for the burst tail.
+            scenarios.append(('gapped', ['+gpu_rd_latency=24',
+                              '+gpu_rd_latency_var=1', '+gpu_wr_latency=17',
+                              '+gpu_rd_beat_gap=7']))
+        for label, plus in scenarios:
             with (dest / (label + '.log')).open('w') as log:
                 p = subprocess.run([str(dest / 'obj/Vtb_gpu'), *plus], cwd=dest,
                                    stdout=log, stderr=subprocess.STDOUT, timeout=300)

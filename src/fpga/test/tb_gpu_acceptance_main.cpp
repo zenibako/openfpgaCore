@@ -337,8 +337,17 @@ static bool wait_fence(uint32_t token, int timeout = 400000) {
 }
 
 static bool submit_and_wait(int timeout = 400000) {
+    const uint64_t start = sim_time;
     uint32_t t = submit_fence();
-    return wait_fence(t, timeout);
+    const bool complete = wait_fence(t, timeout);
+    // Opt-in A/B cycle measurements include command upload and fence drain.
+    // The sequence number identifies identical batches across RTL builds.
+    static unsigned batch = 0;
+    if (std::getenv("GPU_PERF_REPORT"))
+        printf("PERF batch %u cycles %llu complete %d\n", batch,
+               (unsigned long long)((sim_time - start) / 2), complete);
+    ++batch;
+    return complete;
 }
 
 // ============================================================================
@@ -6471,7 +6480,8 @@ static void emit_set_tri_state_raw(const ParamSpanListWire &p,
 // Emit a 0x4B (14-word) vertex triangle.
 static void emit_draw_vert_tri_raw(const int16_t vx[3], const int16_t vy[3],
                                    const int32_t s[3], const int32_t t[3],
-                                   const int32_t zi[3], const uint8_t lrow[3]) {
+                                   const int32_t zi[3], const uint8_t lrow[3],
+                                   uint32_t q29 = 0) {
     std::vector<uint32_t> w(14, 0);
     w[0]  = ((uint32_t)(uint16_t)vy[0] << 16) | (uint16_t)vx[0];
     w[1]  = ((uint32_t)(uint16_t)vy[1] << 16) | (uint16_t)vx[1];
@@ -6482,7 +6492,7 @@ static void emit_draw_vert_tri_raw(const int16_t vx[3], const int16_t vy[3],
     w[12] = ((uint32_t)(lrow[0] & 0x3F))
           | ((uint32_t)(lrow[1] & 0x3F) << 6)
           | ((uint32_t)(lrow[2] & 0x3F) << 12);
-    w[13] = 0;
+    w[13] = q29;
     ring_cmd(0x4B, (uint32_t)w.size());
     for (uint32_t x : w)
         ring_write(x);
@@ -6522,6 +6532,49 @@ static ParamSpanListWire make_vert_tri_surface() {
     p.flags = SPAN_PERSP;
     return p;
 }
+
+#if defined(GPU_TEST_NO_PARAM_SPAN_Q29) && !defined(GPU_TEST_NO_VERT_TRI)
+// An unadvertised Q29 override must not change the triangle's derive while
+// the fragment path uses Q16.16. Compare real rendered output, including
+// small-subpixel and ordinary reciprocal modes, for every override shift.
+static void test_disabled_vertex_q29_override() {
+    printf("TEST disabled_vertex_q29_override\n");
+    for (int subpix : {0, 1}) {
+        std::vector<uint8_t> reference;
+        for (int shift = -1; shift < 32; ++shift) {
+            gpu_init(); preload_with_sentinel();
+            upload_texture(TEX_BASE_BYTE, make_projection_test_texture());
+            ParamSpanListWire p = make_vert_tri_surface();
+            p.subpix_y = subpix;
+            const int16_t x[3] = {16*16, 24*16, 16*16+1};
+            const int16_t y[3] = {16, 17, 48};
+            const int16_t ysub[3] = {16*16, 16*16+1, 20*16};
+            const int32_t s[3] = {0, 16<<16, 4<<16};
+            const int32_t t[3] = {0, 2<<16, 24<<16};
+            const int32_t zi[3] = {65536, 32768, 49152};
+            const uint8_t light[3] = {0, 0, 0};
+            emit_set_tri_state_raw(p, 0, 64, 0, 64);
+            emit_draw_vert_tri_raw(x, subpix ? ysub : y, s, t, zi, light,
+                                   shift < 0 ? 0u : (32u | (uint32_t)shift));
+            if (!submit_and_wait()) {
+                check_fail("disabled_vertex_q29_override", "timeout"); return;
+            }
+            std::vector<uint8_t> pixels;
+            int painted = 0;
+            for (int py = 0; py < 64; ++py) for (int px = 0; px < 64; ++px) {
+                uint8_t v = sdram_read_byte(FB_BASE_BYTE + py*320u + px);
+                pixels.push_back(v); painted += v != SENTINEL_BYTE;
+            }
+            if (shift < 0) reference = pixels;
+            if (!painted || pixels != reference) {
+                check_fail("disabled_vertex_q29_override", "override changed pixels or triangle blank");
+                return;
+            }
+        }
+    }
+    check_pass("disabled_vertex_q29_override");
+}
+#endif
 
 // Render one vert-triangle two ways (0x4A+0x4B at FB_BASE; 0x49-with-derived
 // planes at FB_ALT_BASE) and return the per-pixel mismatch count over the walk
@@ -9615,8 +9668,9 @@ static void test_lean_sticky_state_contract() {
 // (full: 33 > 32 so not compact-direct; lean: 33 >= the raised long-form
 // minimum).  The wire layout carries record A entirely inside words 31..32
 // (word 33 of a full pair only holds the dummy record-B fields), so a
-// 33-word payload with rec_count=1 must draw record A byte-exactly — and
-// identically in both configs.  A boundary bug in either direction (lean
+// 33-word payload with rec_count=1 must draw record A byte-exactly when
+// long-form lists are enabled, or drain when that frontend is cut. A boundary
+// bug in either direction (lean
 // bound >33, or full compact bound >32) breaks the byte-exact compare.
 static void test_lean_wrong_size_0x48_33w() {
     printf("TEST lean_wrong_size_0x48_33w (lean=%d)\n", LEAN_CONFIG ? 1 : 0);
@@ -9642,7 +9696,9 @@ static void test_lean_wrong_size_0x48_33w() {
     auto w = encode_param_span_list_wire(p, {rec});   // 34 words
     w.resize(33);                                     // drop the record-B word
     emit_raw_command(0x48, w);
+#ifndef GPU_TEST_NO_PARAM_SPAN_LIST
     m.apply_span_ref(param_affine_ref_span(p, rec));
+#endif
 
     // Marker clear proves the stream advanced past the 33-word command.
     cmd_clear_rect(FB_BASE_BYTE + 8u * 320u + 1u, 4, 1, 0, 0x6E);
@@ -11128,6 +11184,13 @@ static void test_vert_tri_subpixel_y_attrib() {
     struct C { int16_t vx[3], vy[3]; int32_t s[3], t[3], zi[3]; uint8_t l[3];
                int16_t cx0, cx1, cy0, cy1; };
     C cs[] = {
+        // Determinants 8191/8192/8193 straddle the Q31/Q44 reciprocal switch.
+        { {320,448,321}, {320,321,384},
+          {0,16*Q,4*Q},{0,2*Q,24*Q},{Q,Q/2,3*Q/4},{0,0,0}, 0,64,0,28 },
+        { {320,448,320}, {320,321,384},
+          {0,16*Q,4*Q},{0,2*Q,24*Q},{Q,Q/2,3*Q/4},{0,0,0}, 0,64,0,28 },
+        { {320,448,319}, {320,321,384},
+          {0,16*Q,4*Q},{0,2*Q,24*Q},{Q,Q/2,3*Q/4},{0,0,0}, 0,64,0,28 },
         // v0,v1 share integer scanline 8 (Q12.4 8.125 / 8.8125) — degenerate
         // under round-Y, fine under Q12.4.
         { {(int16_t)(10*16),(int16_t)(50*16),(int16_t)(30*16+5)},
@@ -11820,6 +11883,153 @@ static void test_vtx_cache_slot_reuse_and_wrap() {
 }
 #endif  // GPU_TEST_XFORM
 
+// Long-form affine spans remain available on os20. The older translucency
+// tests use compact spans, which os20 never supported, so exercise the live
+// path explicitly with colormaps, masked pixels and overlapping writes.
+static void test_param_span_translucency() {
+    printf("TEST param_span_translucency\n");
+    gpu_init();
+    FbModel m = preload_with_sentinel();
+    auto table = make_transluc_table_avg();
+    upload_transluc_table(table);
+    m.transluc = table;
+    auto tex = make_param_test_texture();
+    tex[4] = 0xFF;
+    upload_texture(TEX_BASE_BYTE, tex);
+    upload_palookup_identity_row(0, 0);
+    upload_palookup_const_row(3, 2, 0x77);
+    m.snapshot_from_sdram();
+    cmd_set_fb(FB_BASE_BYTE, 320);
+    m.st_fb_addr = FB_BASE_BYTE;
+    cmd_clear_rect(FB_BASE_BYTE, 320, 6, 0, 0x10);
+    m.apply_clear_rect(FB_BASE_BYTE, 320, 6, 0, 0x10);
+    ParamSpanListWire p {};
+    p.fb_base = FB_BASE_BYTE;
+    p.fb_major_step = 320;
+    p.fb_minor_step = 1;
+    p.tex_addr = TEX_BASE_BYTE;
+    p.tex_width = 64;
+    p.tex_w_mask = p.tex_h_mask = 63;
+    p.attr_du[0] = 1 << 16;
+    p.attr_dv[1] = 1 << 16;
+    for (unsigned flags : {0x40u, 0x41u, 0x45u}) {
+        p.flags = flags; // blend, then colormap, then transparent-texel skip
+        p.colormap_id = flags == 0x41 ? 3 : 0;
+        p.light_origin = flags == 0x41 ? 2 << 16 : 0;
+        std::vector<ParamSpanRecordWire> records = {
+            {1, 0, 17}, {1, 0, 17}, {3, 1, 0}, {2, 2, 31}, {6, 2, 9}
+        };
+        emit_param_span_list_raw(p, records);
+        for (const auto &r : records)
+            m.apply_span_ref(param_affine_ref_span(p, r));
+    }
+    // Successive fragments target the same byte; blending must see each
+    // preceding write, including across a word boundary and negative stride.
+    for (int stride : {0, -1}) {
+        p.fb_base = FB_BASE_BYTE + 3 * 320 + 13;
+        p.fb_minor_step = stride;
+        p.flags = 0x40;
+        std::vector<ParamSpanRecordWire> records = {{0, 0, 11}};
+        emit_param_span_list_raw(p, records);
+        m.apply_span_ref(param_affine_ref_span(p, records[0]));
+    }
+    if (!submit_and_wait()) {
+        check_fail("param_span_translucency", "timeout");
+        return;
+    }
+    compare_fb_region("param_span_translucency.fb", m,
+                      FB_BASE_BYTE, 320, 0, 0, 320, 6);
+}
+
+static void test_disabled_span_modes_drain() {
+    printf("TEST disabled_span_modes_drain\n");
+    gpu_init();
+    FbModel m = preload_with_sentinel();
+    upload_texture(TEX_BASE_BYTE, make_param_test_texture());
+    m.snapshot_from_sdram();
+    ParamSpanListWire p {};
+    p.fb_base = FB_BASE_BYTE;
+    p.fb_major_step = 320;
+    p.fb_minor_step = 1;
+    p.tex_addr = TEX_BASE_BYTE;
+    p.tex_width = 64;
+    p.tex_w_mask = p.tex_h_mask = 63;
+    p.attr_origin[2] = 1 << 16;
+    p.attr_du[0] = 1 << 16;
+    p.z_base = FB_ALT_BASE_BYTE;
+    p.z_major_step = 640;
+    p.z_minor_step = 2;
+    std::vector<ParamSpanRecordWire> records = {{1, 0, 17}, {0, 1, 31}, {0, 2, 0}};
+#ifdef GPU_TEST_NO_PERSPECTIVE
+    for (unsigned mode : {1u, 3u}) {
+        p.attr_mode = mode;
+        emit_param_span_list_raw(p, records);
+    }
+#endif
+#ifdef GPU_TEST_NO_DEPTH
+    p.attr_mode = 1;
+    for (unsigned mode : {1u, 2u, 3u}) {
+        p.z_mode = mode;
+        emit_param_span_list_raw(p, records);
+    }
+#endif
+    // A valid affine draw and clear must still execute after rejected payloads.
+    p.attr_mode = p.z_mode = 0;
+    records = {{2, 3, 7}};
+    emit_param_span_list_raw(p, records);
+    m.apply_span_ref(param_affine_ref_span(p, records[0]));
+    cmd_clear_rect(FB_BASE_BYTE + 5 * 320, 13, 1, 0, 0x77);
+    m.apply_clear_rect(FB_BASE_BYTE + 5 * 320, 13, 1, 0, 0x77);
+    if (!submit_and_wait()) {
+        check_fail("disabled_span_modes_drain", "timeout");
+        return;
+    }
+    compare_fb_region("disabled_span_modes_drain.fb", m,
+                      FB_BASE_BYTE, 320, 0, 0, 320, 6);
+    compare_fb_region("disabled_span_modes_drain.z_untouched", m,
+                      FB_ALT_BASE_BYTE, 640, 0, 0, 640, 6);
+}
+
+// Disabled long lists must consume every payload word, including lists that
+// would pause for rasterization between record chunks on the full GPU. The
+// following triangle must see the same sticky-state invalidation contract,
+// and a marker clear plus fence must still complete without any span writes.
+static void test_disabled_long_span_lists_drain() {
+    for (unsigned count : {1u, 4u, 5u, 9u, 17u, 129u}) {
+        gpu_init();
+        FbModel m = preload_with_sentinel();
+        upload_texture(TEX_BASE_BYTE, make_param_test_texture());
+        m.snapshot_from_sdram();
+        auto p = make_vert_tri_surface();
+        p.attr_mode = 0;
+        p.attr_du[0] = 1 << 16;
+        p.attr_dv[1] = 1 << 16;
+        std::vector<ParamSpanRecordWire> records;
+        for (unsigned i = 0; i < count; ++i)
+            records.push_back({uint16_t(3 + i % 4), uint16_t(4 + i % 12), 12});
+        emit_set_tri_state_raw(p, 0, 320, 0, 64);
+        emit_param_span_list_raw(p, records);
+        const int16_t x[3] = {16, 32*16, 16};
+        const int16_t y[3] = {1, 1, 24};
+        const int32_t uv[3] = {0, 0, 0}, zi[3] = {65536, 65536, 65536};
+        const uint8_t light[3] = {0, 0, 0};
+        emit_draw_vert_tri_raw(x, y, uv, uv, zi, light);
+        cmd_clear_rect(FB_BASE_BYTE + 30u*320u + 1u, 4, 1, 0, 0x5C);
+        m.apply_clear_rect(FB_BASE_BYTE + 30u*320u + 1u, 4, 1, 0, 0x5C);
+        char name[80];
+        snprintf(name, sizeof(name), "disabled_long_span_%u_records", count);
+        if (!submit_and_wait()) {
+            check_fail(name, "payload drain or following fence timed out");
+            continue;
+        }
+        compare_fb_region(name, m, FB_BASE_BYTE, 320, 0, 0, 64, 34);
+    }
+}
+
+#ifdef GPU_TEST_GEOMETRY
+#include "gpu_geometry.h"
+#endif
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     Verilated::traceEverOn(false);
@@ -11875,6 +12085,8 @@ int main(int argc, char **argv) {
     test_transluc_overdraw_same_word();
     test_transluc_duplicate_lane_order();
 #endif
+#ifndef GPU_TEST_NO_PARAM_SPAN_LIST
+#ifndef GPU_TEST_NO_PERSPECTIVE
     test_persp_constant_z_matches_affine();
     test_persp_span_group_varcount_const_z_equals_single_lane_spans();
 #ifndef GPU_TEST_NO_PALETTE
@@ -11889,6 +12101,13 @@ int main(int argc, char **argv) {
     test_persp_span_group_quake_rows_match_single_lane_spans();
     test_persp_span_group_quake_payload_cpu_oracle();
     test_persp_span_group_quake_payload_edge_cases();
+#endif
+#ifdef GPU_TEST_TRANSLUC
+    test_param_span_translucency();
+#endif
+#if defined(GPU_TEST_NO_PERSPECTIVE) || defined(GPU_TEST_NO_DEPTH)
+    test_disabled_span_modes_drain();
+#endif
     test_param_span_list_affine_rows();
     test_param_span_list_affine_columns();
     test_param_span_list_affine_clamp();
@@ -11898,6 +12117,8 @@ int main(int argc, char **argv) {
 #ifndef GPU_TEST_NO_PALETTE
     test_param_span_list_colormap_skip_zero();
 #endif
+#endif
+
     /* Wrong-size / degenerate / unsupported-header drains hold with the
      * param-tri module pruned too — the commands must still drain. */
     test_param_tri_wrong_size_noop_drains();
@@ -11929,12 +12150,16 @@ int main(int argc, char **argv) {
     test_param_tri_recs_sticky_semantics();
     test_param_tri_recs_wrong_size_noop();
 #endif
+#ifndef GPU_TEST_NO_PARAM_SPAN_LIST
+#ifndef GPU_TEST_NO_PERSPECTIVE
     test_param_span_list_persp_matches_helper();
 #ifndef GPU_TEST_NO_PARAM_SPAN_Q29
     /* z-projection oracles need the q29 dynamic-scale z cone; the Doom
      * captures replay real q29_attr_shift/z_mode streams whose z tests
      * reject differently once the cone is folded. */
+#ifndef GPU_TEST_NO_DEPTH
     test_param_span_quake_projection_math();
+#endif
     test_param_span_q29_high_angle_floor_no_flatten();
 #endif
     test_param_q29_tail_counts_and_boundaries();
@@ -11945,6 +12170,9 @@ int main(int argc, char **argv) {
     test_doom_real_capture_frame_no_black_columns();
 #endif
     test_param_q29_zero_counts_mixed_no_drop();
+#endif
+    // These stress cases use affine spans even though they originated in
+    // the Doom/Quake suite. Keep them enabled when perspective is removed.
     test_param_q48_multichunk_distinct_column_drop_repro();
 #ifndef GPU_TEST_OS30_LEAN
     /* >4-lane 0x4C paint sweep — 0x4C is a documented no-op in the lean
@@ -11957,12 +12185,16 @@ int main(int argc, char **argv) {
     // column => port-A miss per pixel + port-B used every pixel.  Inert under
     // the 2-cycle stub; the SUSPECT-1 vehicle under +gpu_rd_latency[_var].
     test_portb_starve_distinct_cache_line_wall();
+#ifndef GPU_TEST_NO_PERSPECTIVE
     test_param_q29_wrap_and_fb_byte_lanes();
     test_param_q29_static_repeat_300();
 #ifndef GPU_TEST_NO_PARAM_SPAN_Q29
     test_param_q29_dynamic_scale_projection();
     test_param_q29_dynamic_scale_all_records_touch();
+#ifndef GPU_TEST_NO_DEPTH
     test_param_q29_dynamic_scale_z_restore_saturates();
+#endif
+#endif
 #endif
     /* reserved_bits_noop holds in BOTH folds: with the cone folded the
      * reserved bits are no-ops by construction. */
@@ -11970,6 +12202,7 @@ int main(int argc, char **argv) {
 #ifndef GPU_TEST_OS30_LEAN
     test_affine_span_group_quake_alias_carry_math();
 #endif
+#ifndef GPU_TEST_NO_DEPTH
     test_param_span_list_z_write_zi();
     test_param_span_list_z_test_zi();
     test_param_span_list_z_test_write_skip_zero();
@@ -11981,6 +12214,9 @@ int main(int argc, char **argv) {
     test_param_span_z_raw_pair_word_halves_lo_hi();
     test_param_span_z_raw_pair_word_halves_hi_lo();
     test_param_span_z_raw_pair_skip_zero_between();
+#endif
+#endif
+
 #ifndef GPU_TEST_OS30_LEAN
     /* Compact-direct 0x48 span-group / batch / DMA-mix tests — every one
      * emits 11/18/25/32-word 0x48 payloads, the form the lean config
@@ -12008,7 +12244,9 @@ int main(int argc, char **argv) {
     test_span_group_eight_lane_colormap();
     test_batch_dma_equals_inline();
     test_command_stream_dma_mixed_affine_groups();
+#ifndef GPU_TEST_NO_PERSPECTIVE
     test_command_stream_dma_mixed_persp_span_group();
+#endif
     if (!cpu_transport) test_dma_descriptor_queue_two_streams();
 #endif
 #if GPU_TEST_ENABLE_TRIANGLES
@@ -12035,10 +12273,16 @@ int main(int argc, char **argv) {
     test_lean_column_list_drains();
 #ifndef GPU_TEST_NO_VERT_TRI
     test_lean_sticky_state_contract();
+#ifdef GPU_TEST_NO_PARAM_SPAN_Q29
+    test_disabled_vertex_q29_override();
+#endif
 #else
     test_disabled_vertex_commands_drain();
 #endif
     test_lean_wrong_size_0x48_33w();
+#ifdef GPU_TEST_NO_PARAM_SPAN_LIST
+    test_disabled_long_span_lists_drain();
+#endif
 
 #ifdef GPU_TEST_TRUECOLOR
     test_vert_tri_rgb_pack_depth();
@@ -12083,6 +12327,9 @@ int main(int argc, char **argv) {
     test_vtx_cache_slot_reuse_and_wrap();               // TEST D
 #endif
 
+#ifdef GPU_TEST_GEOMETRY
+    test_geometry();
+#endif
     printf("\n=== Acceptance Results: %d passed, %d failed ===\n",
            pass_count, fail_count);
     printf("=== Total sim_time: %llu ===\n", (unsigned long long)sim_time);

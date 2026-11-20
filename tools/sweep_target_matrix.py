@@ -114,12 +114,38 @@ def docker(out, target, cwd, command):
     raise ValueError('No Quartus backend for target ' + target)
 
 
+
+def pocket_source_overrides(text, source_map):
+    """Select an optional variant snapshot without changing other variants."""
+    if not source_map.is_file():
+        return text
+    overrides = {}
+    for line in source_map.read_text().splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith('#'):
+            continue
+        if len(fields) != 2 or fields[0] in overrides:
+            raise ValueError('Invalid source override: ' + line)
+        overrides[fields[0]] = fields[1]
+    for old, new in overrides.items():
+        pattern = r'^(set_global_assignment -name (?:VERILOG_FILE|SYSTEMVERILOG_FILE) )' + re.escape(old) + r'$'
+        text, count = re.subn(pattern, lambda match: match[1] + new, text, flags=re.M)
+        if count != 1:
+            raise ValueError('Source override must match once: ' + old)
+    return text
+
+
 def prepare(frozen, dest, row, seed, processors):
     shutil.copytree(frozen, dest)
     project = 'mister' if row['target'] == 'mister' else 'ap_core'
     directory = dest / 'src/fpga/targets' / row['target']
     qsf = directory / (project + '.qsf')
     text = qsf.read_text()
+    variant_qsf = directory / 'variants' / (row['variant'] + '.qsf')
+    if row['target'] == 'pocket' and variant_qsf.is_file():
+        text += '\n' + variant_qsf.read_text()
+    if row['target'] == 'pocket':
+        text = pocket_source_overrides(text, directory / 'variants' / (row['variant'] + '.sources'))
     legacy_selector = row['target'] == 'mister' and 'source cpu_select.tcl' in text
     text = re.sub(r'^set_global_assignment -name (SEED|NUM_PARALLEL_PROCESSORS) .*\n',
                   '', text, flags=re.M)
@@ -215,6 +241,18 @@ def verify_frozen(out):
     return frozen
 
 
+def seed_candidates(rows, offsets, seeds=None):
+    if seeds is None:
+        tasks = [(row, row['seed'] + offset) for offset in offsets for row in rows]
+    else:
+        tasks = [(row, seed) for seed in seeds for row in rows]
+        # A full range must still measure the saved seed if it lies outside it.
+        tasks += [(row, row['seed']) for row in rows if row['seed'] not in seeds]
+    if any(seed < 1 for _, seed in tasks) or len({(r['variant'], s) for r, s in tasks}) != len(tasks):
+        raise ValueError('invalid or duplicate seeds')
+    return tasks
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -225,7 +263,10 @@ def main():
                         help='Also sweep the archived SDRAM diagnostic configurations')
     parser.add_argument('--jobs', type=int, default=4)
     parser.add_argument('--processors', type=int, default=4)
-    parser.add_argument('--seed-offsets', nargs='+', type=int, default=[0, 1, 2])
+    seed_selection = parser.add_mutually_exclusive_group()
+    seed_selection.add_argument('--seed-offsets', nargs='+', type=int, default=[0, 1, 2])
+    seed_selection.add_argument('--seeds', nargs='+', type=int,
+                                help='Absolute seeds for every variant; also includes each saved seed')
     parser.add_argument('--target', action='append', help='Restrict a retry to specific target(s)')
     parser.add_argument('--variant', help='Restrict a diagnostic trial to one variant')
     parser.add_argument('--extra-macro', action='append', default=[],
@@ -248,6 +289,7 @@ def main():
         rows = json.loads((out / 'inventory.json').read_text())
         previous = json.loads((out / 'config.json').read_text())
         args.seed_offsets = previous['seed_offsets']
+        args.seeds = previous.get('seeds')
         if args.processors != previous['processors']:
             parser.error('Resume must retain the original per-fit processor count')
         # A killed driver can leave a Docker tool running. It must not write
@@ -285,13 +327,14 @@ def main():
             parser.error('Diagnostic macros require one variant and uppercase identifiers')
         rows[0]['original_defs'] = rows[0]['defs']
         rows[0]['defs'] += ' ' + ' '.join(args.extra_macro)
+    try:
+        tasks = seed_candidates(rows, args.seed_offsets, args.seeds)
+    except ValueError as error:
+        parser.error(str(error))
     if not args.resume:
         frozen = freeze(out, rows)
-    tasks = [(row, row['seed'] + offset) for offset in args.seed_offsets for row in rows]
-    if any(seed < 1 for _, seed in tasks) or len({(r['variant'], s) for r,s in tasks}) != len(tasks):
-        parser.error('invalid or duplicate seed offsets')
     save(out / 'config.json', dict(jobs=args.jobs, processors=args.processors,
-        seed_offsets=args.seed_offsets, variants=len(rows), candidates=len(tasks)))
+        seed_offsets=args.seed_offsets, seeds=args.seeds, variants=len(rows), candidates=len(tasks)))
 
     def run(pair):
         row, seed = pair

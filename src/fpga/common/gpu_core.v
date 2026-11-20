@@ -28,6 +28,16 @@
 `default_nettype none
 
 module gpu_core #(
+    // os20 keeps affine texturing, colormaps and translucency, but its
+    // ScummVM/Diablo clients do not use perspective or depth. Disabled
+    // modes reject their headers and drain the payload without drawing.
+    // Keep these in sync with axi_periph_slave's capability parameters.
+    parameter INCLUDE_PERSPECTIVE = 1,
+    parameter INCLUDE_DEPTH = 1,
+    // Long-form 0x48 header/record input. Triangle commands still use the
+    // shared span producer; compact 0x48 and columns have separate gates.
+    // Match axi_periph_slave's bit-15 capability on each target.
+    parameter INCLUDE_PARAM_SPAN_LIST = 1,
     // Capability-gated CPU upload port; legacy clients retain doorbell DMA.
     parameter INCLUDE_CPU_RING = 0,
     // Direct-only builds require INCLUDE_CPU_RING and updated applications.
@@ -350,7 +360,7 @@ module gpu_core #(
     output wire [31:0] dbg_frag
 );
 
-localparam GPU_ENABLE_PERSP     = 1'b1;
+localparam GPU_ENABLE_PERSP     = (INCLUDE_PERSPECTIVE != 0);
 
 // GPU byte-address datapath width.  The SDRAM slave (axi_sdram_slave.v)
 // physically decodes only address bits [25:2] — a 64 MB (2^26-byte) space —
@@ -382,7 +392,8 @@ assign dbg_frag = 32'd0;
 // 0x14  GPU_STATUS        R   bit0=busy, bit1=ring_empty, bit2=dma_busy,
 //                              bit3=transluc_busy, [5:4]=dma_state,
 //                              bit6=dma_desc_full, bit7=CPU upload capability,
-//                              bit8=CPU mode, bit9=CPU overflow
+//                              bit8=CPU mode, bit9=CPU overflow,
+//                              bit10=SM64 geometry, bit11=independent worker
 // 0x18  GPU_FENCE         R   Last completed fence token
 // 0x1C  GPU_DMA_LEN       W   Word count to pull (max 4096)
 // 0x20  GPU_TRANSLUC_ADDR W   byte address into transluc[] upload window
@@ -412,13 +423,14 @@ assign dbg_frag = 32'd0;
 // Port B: GPU reads during command fetch (1-cycle latency)
 localparam RING_WORDS = 4096;  // 16 KB
 localparam RING_ADDR_BITS = 12;
+localparam GEOMETRY_WORKER = `ifdef INCLUDE_GPU_GEOMETRY_WORKER 1 `else 0 `endif;
 
 reg [31:0] ring_bram [0:RING_WORDS-1];
 reg [RING_ADDR_BITS-1:0] ring_wr_addr;  // Append pointer (word index)
 reg [RING_ADDR_BITS-1:0] ring_wrptr;     // Published write pointer (word index)
 reg [RING_ADDR_BITS-1:0] ring_rdptr;     // GPU read pointer (word index)
 reg [RING_ADDR_BITS-1:0] ring_rd_addr;   // Port-B read address
-reg [31:0] ring_rd_data;                  // Ring BRAM port B read output (registered)
+wire [31:0] ring_rd_data;                 // Registered command-ring read output
 
 // CPU upload address for the transluc[] LUT (32 KB).  Palookups live in SDRAM
 // and the GPU reads them through gpu_tex_cache port B; transluc[] is GPU-private
@@ -492,17 +504,39 @@ wire       dma_busy = dma_pull_busy;
 localparam DMA_STARVE_THRESHOLD = 10'd512;
 reg [9:0] dma_starve_count;
 
-wire ring_empty = (ring_rdptr == ring_wrptr);
+wire [RING_ADDR_BITS-1:0] command_wrptr, upload_rdptr;
+wire geometry_worker_busy;
+wire ring_empty = (ring_rdptr == command_wrptr);
 wire [15:0] ring_wrptr_bytes = {2'b0, ring_wrptr, 2'b0};
-wire [15:0] ring_rdptr_bytes = {2'b0, ring_rdptr, 2'b0};
+wire [15:0] ring_rdptr_bytes = {2'b0, upload_rdptr, 2'b0};
 wire transluc_upload_busy;
 
 assign busy = dma_busy || transluc_upload_busy || !ring_empty || (state != S_IDLE)
+            || geometry_worker_busy
             || (GPU_WRITE_COMBINE && !fb_write_drain_complete);
 
 // Port B: GPU read (synchronous, 1-cycle latency)
-always @(posedge clk)
-    ring_rd_data <= ring_bram[ring_rd_addr];
+generate if (GEOMETRY_WORKER) begin : g_geometry_worker
+    wire [RING_ADDR_BITS-1:0] address;
+    reg [31:0] data;
+    always @(posedge clk) data <= ring_bram[address];
+    gpu_geometry_worker #(.ADDR_BITS(RING_ADDR_BITS), .QUEUE_BITS(9)) worker (
+        .clk(clk), .reset_n(reset_n), .enable(active),
+        .soft_reset(soft_reset), .ring_reset(ring_reset),
+        .input_wrptr(ring_wrptr), .input_rdptr(upload_rdptr),
+        .input_addr(address), .input_data(data),
+        .output_rdptr(ring_rdptr), .output_addr(ring_rd_addr),
+        .output_data(ring_rd_data), .output_wrptr(command_wrptr),
+        .busy(geometry_worker_busy)
+    );
+end else begin : g_direct_commands
+    reg [31:0] data;
+    always @(posedge clk) data <= ring_bram[ring_rd_addr];
+    assign ring_rd_data = data;
+    assign command_wrptr = ring_wrptr;
+    assign upload_rdptr = ring_rdptr;
+    assign geometry_worker_busy = 1'b0;
+end endgenerate
 
 // DMA word-write into ring BRAM port A: asserted by the DMA FSM
 // when an R-beat lands (dma_state==DMA_S_R && m_rd_rvalid).  These
@@ -512,7 +546,7 @@ wire [31:0] dma_ring_wdata_raw;
 wire cpu_ring_req = INCLUDE_CPU_RING && cpu_ring_mode && reg_wr
                   && (reg_addr == 4'd1) && active;
 wire [11:0] cpu_ring_next = ring_wr_addr + 12'd1;
-wire cpu_ring_full = (cpu_ring_next == ring_rdptr);
+wire cpu_ring_full = (cpu_ring_next == upload_rdptr);
 wire cpu_ring_write = cpu_ring_req && !cpu_ring_full && !dma_busy;
 
 // Canonical altsyncram-inferable single-port write to ring_bram.  Commands are
@@ -691,7 +725,9 @@ always @(*) begin
         //   bit 7     = CPU upload capability
         //   bit 8     = CPU upload mode selected
         //   bit 9     = sticky CPU append overflow (cleared by ring reset)
-        4'd5:    reg_rdata = {22'b0, (INCLUDE_CPU_RING && cpu_ring_overflow),
+        // Bit 10 advertises the version-1 raw-vertex geometry command (0x59)
+        // and indexed-draw culling bits. Old cores return zero here.
+        4'd5:    reg_rdata = {20'b0, (GEOMETRY_WORKER != 0), (SM64_GEOMETRY != 0), (INCLUDE_CPU_RING && cpu_ring_overflow),
                               (INCLUDE_CPU_RING && cpu_ring_mode), (INCLUDE_CPU_RING != 0),
                               dma_desc_full, dma_state, transluc_upload_busy,
                               dma_busy, ring_empty, busy};
@@ -1055,7 +1091,7 @@ gpu_tex_cache #(
 //     `dma_bus_idle`, an in-flight tex burst MUST keep receiving its
 //     R-beats — masking them would leave the cache deadlocked in
 //     S_FILL_DATA after DMA's burst eventually starts.
-wire blend_owns_m0  = (fbss == FBSS_ZTEST_R_WAIT)
+wire blend_owns_m0  = zw_fill_busy || (fbss == FBSS_ZTEST_R_WAIT)
                    || (fbss == FBSS_BLEND_R_WAIT)
                    || (fbss == FBSS_CB_FILLR);
 wire dma_owns_ar    = (dma_state == DMA_S_AR)
@@ -1427,6 +1463,10 @@ localparam CMD_LOAD_VERTS             = 8'h53;  // T3: transform N raw verts -> 
 localparam CMD_DRAW_INDEXED_TRI       = 8'h54;  // T3: 3 cache indices -> derive (draw-many)
 localparam CMD_SET_LIGHT_STATE        = 8'h55;  // T4: sticky light dir/colour/ambient
 localparam CMD_LOAD_VERT_LIT          = 8'h57;  // T4: transform+light one vert -> cache
+localparam CMD_LOAD_GEOMETRY          = 8'h59;  // 1..3 packed vertices (worker: 1..32)
+localparam CMD_DRAW_GEOMETRY_TRI      = 8'h5B;  // indexed draw with explicit culling
+localparam CMD_LOAD_PROJECTED         = 8'h5C;  // worker output: slot/RGB, xy, zi, s, t, depth
+localparam SM64_GEOMETRY = `ifdef INCLUDE_GPU_SM64_GEOMETRY 1 `else 0 `endif;
 localparam CMD_LOAD_VERT_CLIP         = 8'h56;  // T3: park ONE pre-transformed clip-space
                                                 //   vert {x,y,w} in the cache (XF_CLIP_FEED,
                                                 //   skips the MAC entirely) -- the cache-load
@@ -1731,17 +1771,27 @@ reg signed [31:0] spanprod_clamp0_min;
 reg signed [31:0] spanprod_clamp0_max;
 reg signed [31:0] spanprod_clamp1_min;
 reg signed [31:0] spanprod_clamp1_max;
-// EMIT-hoist: 1-bit (!=0) mirrors of the four clamp staging words above,
-// computed at the payload-load sites (0x49/0x4A words 20-23 write, compact
-// 0x48 w0 clear — the ONLY write sites of the 32-bit regs) so the EMIT
-// clamp-enable derivation reads flags instead of four 32-bit reductions.
-// Deliberately no reset term: the 32-bit regs carry none either, and both
-// initialize to 0 (Verilator runtime default / Cyclone V FF power-up), so
-// flag == (reg != 0) holds from time zero.
+// EMIT uses 1-bit nonzero flags for the four clamp staging words. Normally
+// the payload loader updates them alongside those words. os30 registers the
+// reduction one cycle later, well before EMIT consumes it, to shorten the
+// command-RAM path. The flags and staging words need no reset: every command
+// that consumes them first loads or clears the complete clamp state.
 reg spanprod_clamp0_min_nz;
 reg spanprod_clamp0_max_nz;
 reg spanprod_clamp1_min_nz;
 reg spanprod_clamp1_max_nz;
+`ifdef INCLUDE_GPU_CLAMP_FLAGS_PIPE
+// Clamp words are loaded before the remaining header/triangle payload. The
+// span emitter cannot consume them until after that payload and span setup,
+// leaving a cycle to reduce the staging registers instead of the ring RAM.
+// This removes the 32-bit zero test from the command-memory output path.
+always @(posedge clk) begin
+    spanprod_clamp0_min_nz <= (spanprod_clamp0_min != 32'd0);
+    spanprod_clamp0_max_nz <= (spanprod_clamp0_max != 32'd0);
+    spanprod_clamp1_min_nz <= (spanprod_clamp1_min != 32'd0);
+    spanprod_clamp1_max_nz <= (spanprod_clamp1_max != 32'd0);
+end
+`endif
 reg [GPU_ADDR_W-1:0] spanprod_z_base;
 reg signed [GPU_ADDR_W-1:0] spanprod_z_major_step;
 reg signed [GPU_ADDR_W-1:0] spanprod_z_minor_step;
@@ -1906,6 +1956,7 @@ wire [1:0] spanprod_last_idx =
 // hand-off, the S_SPANPROD_SETUP continuation, and the fragment-pipe
 // retire continuation) — one 16-bit comparator instead of three.
 wire spanprod_more_records_w =
+      (INCLUDE_PARAM_SPAN_LIST != 0) &&
       (spanprod_records_left > {13'd0, spanprod_record_count});
 
 task load_param_span_list_payload_word;
@@ -1947,10 +1998,12 @@ task load_param_span_list_payload_word;
                     spanprod_clamp0_max   <= 32'sd0;
                     spanprod_clamp1_min   <= 32'sd0;
                     spanprod_clamp1_max   <= 32'sd0;
+`ifndef INCLUDE_GPU_CLAMP_FLAGS_PIPE
                     spanprod_clamp0_min_nz <= 1'b0;
                     spanprod_clamp0_max_nz <= 1'b0;
                     spanprod_clamp1_min_nz <= 1'b0;
                     spanprod_clamp1_max_nz <= 1'b0;
+`endif
                     // B5: multi-lane count/colormap clear -> mask clear
                     // (SELECT reads 0 for un-rewritten lanes, as before).
                     spanprod_cnt_valid  <= 4'b0000;
@@ -2021,8 +2074,8 @@ task load_param_span_list_payload_word;
                     spanprod_attr_q29      <= EFF_Q29 && data[13] && data[12] && (data[23:20] == PARAM_RECORD_U16V16_COUNT16);
                     spanprod_q29_attr_shift <= 5'd0;
                     spanprod_span_axis     <= data[16];
-                    spanprod_z_write       <= data[24] && (data[23:20] == PARAM_RECORD_U16V16_COUNT16);
-                    spanprod_z_test        <= data[25] && (data[23:20] == PARAM_RECORD_U16V16_COUNT16);
+                    spanprod_z_write       <= INCLUDE_DEPTH && data[24] && (data[23:20] == PARAM_RECORD_U16V16_COUNT16);
+                    spanprod_z_test        <= INCLUDE_DEPTH && data[25] && (data[23:20] == PARAM_RECORD_U16V16_COUNT16);
                     spanprod_header_supported <=
                            ((data[23:20] == PARAM_RECORD_U16V16_COUNT16)
                             && (data[19:17] == 3'd0)
@@ -2033,7 +2086,7 @@ task load_param_span_list_payload_word;
                             && !data[27]
                             && !data[26]
                             && (!(data[25] || data[24])
-                                || (data[12] && !data[6]
+                                || (INCLUDE_DEPTH && data[12] && !data[6]
                                     && (!data[24] || data[25] || !data[2]))));
                 end
                 // Plane fields land in the RAM bank rows (attr0=1,
@@ -2066,6 +2119,12 @@ task load_param_span_list_payload_word;
                     store_pl_dv(4'd4, {{8{data[23]}}, data[23:0]});
                     spanprod_light_dv <= data[23:0];
                 end
+`ifdef INCLUDE_GPU_CLAMP_FLAGS_PIPE
+                6'd20: spanprod_clamp0_min <= data;
+                6'd21: spanprod_clamp0_max <= data;
+                6'd22: spanprod_clamp1_min <= data;
+                6'd23: spanprod_clamp1_max <= data;
+`else
                 6'd20: begin spanprod_clamp0_min <= data;
                              spanprod_clamp0_min_nz <= (data != 32'd0); end
                 6'd21: begin spanprod_clamp0_max <= data;
@@ -2074,6 +2133,7 @@ task load_param_span_list_payload_word;
                              spanprod_clamp1_min_nz <= (data != 32'd0); end
                 6'd23: begin spanprod_clamp1_max <= data;
                              spanprod_clamp1_max_nz <= (data != 32'd0); end
+`endif
                 6'd26: spanprod_z_base <= data[GPU_ADDR_W-1:0];
                 6'd27: spanprod_z_major_step <= data[GPU_ADDR_W-1:0];
                 6'd28: spanprod_z_minor_step <= data[GPU_ADDR_W-1:0];
@@ -2744,8 +2804,8 @@ task spanprod_load_generated_span;
             sp_clamp_enable[1] <= spanprod_clamp1_min_nz
                                || spanprod_clamp1_max_nz;
 
-            sp_z_write_enable <= spanprod_z_write;
-            sp_z_test_enable  <= spanprod_z_test;
+            sp_z_write_enable <= INCLUDE_DEPTH && spanprod_z_write;
+            sp_z_test_enable  <= INCLUDE_DEPTH && spanprod_z_test;
             sp_z_addr       <= spanprod_z_addr_r;
             sp_z_step       <= spanprod_z_minor_step;
             sp_zc_step  <= spanprod_rgb_mode_w
@@ -2792,7 +2852,7 @@ task spanprod_load_generated_span;
             sp_light_step  <= spanprod_span_axis
                             ? spanprod_light_dv : spanprod_light_du;
             sp_persp_q29_mode <= spanprod_use_q29;
-            if (spanprod_attr_persp) begin
+            if (GPU_ENABLE_PERSP && spanprod_attr_persp) begin
             sp_s           <= 32'sd0;
             sp_t           <= 32'sd0;
             sp_sstep       <= 32'sd0;
@@ -2802,7 +2862,7 @@ task spanprod_load_generated_span;
             sp_sZ          <= spanprod_attr0_start_r;
             sp_tZ          <= spanprod_attr1_start_r;
             sp_zinv        <= spanprod_attr2_start_r;
-            persp_active      <= 1'b1;
+            persp_active      <= GPU_ENABLE_PERSP;
             persp_first_done  <= 1'b0;
             persp_prev_valid    <= 1'b0;    // each span starts linear (no A_{N-1})
             persp_prev_anchor_s <= 32'sd0;
@@ -3120,6 +3180,7 @@ localparam S_TRI_DERIVE       = 6'd15; // run the 0x4B plane-derivation sub-FSM
 localparam S_XFORM            = 6'd16; // 0x51 transform front-end (feeds S_TRI_DERIVE)
 localparam S_VCREAD           = 6'd17; // T3: sequential 3-vert cache read (0x54)
                                        // (overlaps the walker setup window)
+localparam S_PAY_WAIT         = 6'd18; // Worker output may pause inside a payload
 
 reg [5:0] state;
 
@@ -3185,7 +3246,11 @@ localparam [4:0] CMDCLS_INDEXED_TRI      = 5'd16;  // 0x54
 localparam [4:0] CMDCLS_SET_LIGHT_STATE  = 5'd17;  // 0x55
 localparam [4:0] CMDCLS_LOAD_VERT_LIT    = 5'd18;  // 0x57
 localparam [4:0] CMDCLS_LOAD_VERT_CLIP   = 5'd19;  // 0x56
+localparam [4:0] CMDCLS_GEOMETRY         = 5'd20;  // 0x59
+localparam [4:0] CMDCLS_PROJECTED        = 5'd21;  // internal worker cache load
 reg [4:0] cmd_class;
+reg [1:0] geometry_cull;  // indexed word bits 15=front, 16=back; screen winding
+reg geometry_sort_odd;
 
 // ================================================================
 // Triangle edge walker (CMD_DRAW_PARAM_TRI)
@@ -3369,6 +3434,8 @@ reg [4:0]         vt_q29_shift;
 //         (num_hi*rdet) + (num_lo*rdet >>> SPLIT)  arith->> (N-SPLIT)
 //       which is bit-identical to ((H<<SPLIT)+L)>>>N but keeps the single
 //       shared accumulator/shift/saturate at 64 bits (no 96-bit cone).
+//       INCLUDE_DERIVE_PARALLEL_SCALE schedules the high and low products
+//       together on the two existing DSP ports; recombination is unchanged.
 //
 // DSP SHARING / MUTUAL EXCLUSION:
 //   EVERY multiply in this derivation goes through the two shared DSP ports
@@ -3445,6 +3512,19 @@ function signed [31:0] deriv_sat32;
     end
 endfunction
 
+// sat32(sign*q) is unchanged when q is first clamped to [-2^31,+2^31].
+// Both endpoints fit signed 33 bits, including their negations. Capturing
+// this range before sign correction avoids a wide negate followed by a
+// wide saturation cone, without inserting another derivative cycle.
+function signed [32:0] deriv_clamp_for_sign;
+    input signed [63:0] v;
+    begin
+        if (v > 64'sd2147483648) deriv_clamp_for_sign = 33'sd2147483648;
+        else if (v < -64'sd2147483648) deriv_clamp_for_sign = -33'sd2147483648;
+        else deriv_clamp_for_sign = v[32:0];
+    end
+endfunction
+
 // Saturating clamp of a 33-bit signed difference (a_k - a0) to int32.  Used
 // for the per-attribute da numerators — these are differences of two signed
 // 32-bit attributes, so 33 bits is exact and avoids a 64-bit comparator cone.
@@ -3515,9 +3595,11 @@ reg signed [15:0] dd_x0, dd_y0; // raw vertex coordinates, fractions preserved
 // 35-bit |det|.  Quotient is capped at 2^31-1 (rdet_ovf) — a sliver with |det|
 // small enough that the rounded reciprocal needs >=2^31 saturates there, so
 // rdet stays a non-negative signed-32 DSP operand.  Mirrors the walker's
-// restoring divider; 46 beats (1 load + 45 iterate).
-reg [31:0]  rdet_q;               // running quotient (>=2^31 trips rdet_ovf)
-reg [44:0]  rdet_dividend;
+// restoring divider; one load plus 45 iterations (32 for small triangles).
+// Consumed dividend bits make room for quotient bits at the low end. Only
+// the completed quotient is read, so no separate 32-bit quotient bank is needed.
+reg [44:0]  rdet_dq;
+wire [31:0] rdet_q = rdet_dq[31:0];
 reg [34:0]  rdet_divisor;
 reg [34:0]  rdet_rem;             // partial remainder (< divisor < 2^35)
 reg [5:0]   rdet_cnt;
@@ -3526,10 +3608,15 @@ reg         rdet_ovf;             // quotient reached >=2^31 -> saturate rdet
 // gradients fit. Use Q31 for subpixel, non-Q29 triangles with |det| <= 8192;
 // the matching scale shift preserves depth, color and texture interpolation.
 reg         rdet_small;
+wire rdet_small_input = spanprod_subpix_y && !vt_q29_en
+                     && (dd_detabs <= 35'd8192);
+wire [44:0] rdet_numerator = ({10'd0, dd_detabs} >> 1)
+                          + (rdet_small_input ? (45'd1 << 31) : (45'd1 << DERIV_N));
 // Reciprocal as a signed 32b DSP operand: capped non-negative value.
 wire signed [31:0] rdet_operand = rdet_ovf ? 32'sh7FFFFFFF : {1'b0, rdet_q[30:0]};
-wire [35:0] rdet_try  = {rdet_rem, rdet_dividend[44]};
+wire [35:0] rdet_try  = {rdet_rem, rdet_dq[44]};
 wire        rdet_ge   = rdet_try >= {1'b0, rdet_divisor};
+wire [44:0] rdet_dq_next = {rdet_dq[43:0], rdet_ge};
 // When rdet_ge, rdet_try - divisor < divisor < 2^35, so the 35-bit subtract is
 // exact; when !rdet_ge, rdet_try < 2^35 already.
 wire [34:0] rdet_next = rdet_ge ? (rdet_try[34:0] - rdet_divisor) : rdet_try[34:0];
@@ -3554,15 +3641,29 @@ reg signed [63:0] drv_qsum_r;
 // q29_shamt is precomputed in DRV_SCALE_LS so the shift control is a register,
 // not a combinational mux off vt_q29_shift.
 reg [4:0]         q29_shamt_r;              // TOTAL shift MINUS 7 (0..31)
-reg signed [56:0] drv_q_coarse, drv_q_fine; // operand already pre-shifted by 7
+reg signed [56:0] drv_q_coarse; // operand already pre-shifted by 7
+`ifdef INCLUDE_DERIVE_PARALLEL_SCALE
+reg signed [32:0] drv_q_fine; // preclamped before the final sign correction
+`else
+reg signed [56:0] drv_q_fine;
+`endif
 // Shared DSP-product capture registers for the derivation FSM.  The derivation
 // is strictly sequential (one DSP launch/capture in flight at a time), so one
-// 64-bit capture per DSP port is enough.  Splitting "read dsp_p -> arithmetic
+// shared capture per DSP port is enough.  Splitting "read dsp_p -> arithmetic
 // -> next dsp operand" into a capture cycle + a form cycle pulls the DSP output
 // off the combinational path into the operand mux (the WNS -1.588 MiSTer chain:
 // Mult1~mult_ll_pl -> 64-bit add -> shift -> saturate -> dsp_a, ~11.3 ns).
-reg signed [63:0] drv_prod_r;
-reg signed [63:0] drv2_prod_r;
+// The unsigned 24x31 reciprocal low product needs 55 bits plus a zero sign.
+// The serial schedule captures it on port 1; the parallel schedule uses
+// port 2, whose other captures need at most a signed 32x17 edge product.
+// Other consumers use only the determinant or origin's low bits.
+reg signed [55:0] drv_prod_r;
+`ifdef INCLUDE_DERIVE_PARALLEL_SCALE
+// The reciprocal low product is unsigned 24x31, requiring 55 bits plus sign.
+reg signed [55:0] drv2_prod_r;
+`else
+reg signed [48:0] drv2_prod_r;
+`endif
 // Q29 anchor a0<<(13-sh) pre-formed in DRV_ORG_CAP (variable barrel shift) so
 // DRV_ORG_FORM is only the two 32-bit subtracts — splits the shift+sub+sub cone
 // that became the worst GPU path once tri_v* was decoupled.  deriv_a0_q +
@@ -3748,6 +3849,10 @@ reg signed [31:0] xf_xscale, xf_yscale; // pixel scale
 reg signed [31:0] xf_nearclip;          // Q16.16 min cam.z
 // Matrix operands have a read-address cycle before the DSP launch. Keep the
 // three coordinate banks in block RAM and use that existing cycle for reads.
+// Without matrix or whole-triangle projection, only 0x56 can enter S_XFORM.
+// Its one vertex can be loaded directly into the projection operand registers.
+localparam SINGLE_CLIP_VERTEX = (INCLUDE_GPU_XFORM_MAC == 0)
+                             && (INCLUDE_CLIP_TRI == 0);
 `ifdef INCLUDE_XFORM_VERTEX_RAM
 (* ramstyle = "M10K, no_rw_check" *) reg signed [31:0] xf_vx [0:2];
 (* ramstyle = "M10K, no_rw_check" *) reg signed [31:0] xf_vy [0:2];
@@ -3758,7 +3863,7 @@ reg [2:0] xf_vert_wr_en;
 always @* begin
     xf_vert_wr_addr = 2'd0;
     xf_vert_wr_en = 3'b000;
-    if (reset_n && !soft_reset && state == S_PAY_DATA) begin
+    if (!SINGLE_CLIP_VERTEX && reset_n && !soft_reset && state == S_PAY_DATA) begin
         case (cmd_class)
             CMDCLS_XFORM_TRI, CMDCLS_XFORM_RGB_CLIP: begin
                 case (pay_idx)
@@ -3782,17 +3887,26 @@ always @* begin
                     default: ;
                 endcase
             end
+            CMDCLS_GEOMETRY: if (SM64_GEOMETRY) begin
+                if (pay_idx == 6'd1) xf_vert_wr_en = 3'b011;
+                if (pay_idx == 6'd2) xf_vert_wr_en = 3'b100;
+            end
             default: ;
         endcase
     end
 end
 always @(posedge clk) begin
-    if (xf_vert_wr_en[0]) xf_vx[xf_vert_wr_addr] <= ring_rd_data;
-    if (xf_vert_wr_en[1]) xf_vy[xf_vert_wr_addr] <= ring_rd_data;
-    if (xf_vert_wr_en[2]) xf_vz[xf_vert_wr_addr] <= ring_rd_data;
-    xf_vx_q <= xf_vx[xf_vtx];
-    xf_vy_q <= xf_vy[xf_vtx];
-    xf_vz_q <= xf_vz[xf_vtx];
+    if (!SINGLE_CLIP_VERTEX) begin
+        if (xf_vert_wr_en[0]) xf_vx[xf_vert_wr_addr] <= (SM64_GEOMETRY && cmd_class == CMDCLS_GEOMETRY)
+            ? {{16{ring_rd_data[15]}}, ring_rd_data[15:0]} : ring_rd_data;
+        if (xf_vert_wr_en[1]) xf_vy[xf_vert_wr_addr] <= (SM64_GEOMETRY && cmd_class == CMDCLS_GEOMETRY)
+            ? {{16{ring_rd_data[31]}}, ring_rd_data[31:16]} : ring_rd_data;
+        if (xf_vert_wr_en[2]) xf_vz[xf_vert_wr_addr] <= (SM64_GEOMETRY && cmd_class == CMDCLS_GEOMETRY)
+            ? {{16{ring_rd_data[15]}}, ring_rd_data[15:0]} : ring_rd_data;
+        xf_vx_q <= xf_vx[xf_vtx];
+        xf_vy_q <= xf_vy[xf_vtx];
+        xf_vz_q <= xf_vz[xf_vtx];
+    end
 end
 `else
 reg signed [31:0] xf_vx [0:2];          // raw verts {x,y,z} Q16.16
@@ -3832,13 +3946,16 @@ reg signed [15:0] xf_sx [0:2], xf_sy [0:2];
 // last read is XF_PROJ_YS2, before XF_PROJ_LAUNCH enters the derive; rdet's
 // last read is DRV_SCALE, inside S_TRI_DERIVE — so the lifetimes never
 // overlap).  The 33-bit dividend (2^32) is loaded LEFT-ALIGNED at bit 44 so
-// the shared MSB tap rdet_dividend[44] sees exactly the bit sequence the old
+// the shared MSB tap rdet_dq[44] sees exactly the bit sequence the old
 // xf_div_dividend[32] tap did; divisor/remainder zero-extend (rem < divisor
 // < 2^32 keeps the top remainder bits 0, and a zero divisor makes ge stuck-1
 // at either width), so the quotient bits shifted into rdet_q are bit-identical
 // to the old xf_div_q.  rdet_ovf is NOT written in recip mode (only DRV_RDET
 // writes it, and both its entry points re-initialize it before use).
-wire [31:0] xf_div_q = rdet_q;    // zi quotient (shared register, read-only alias)
+// Geometry uses a 39-bit numerator to retain full 2^30/w depth precision.
+// Its matrix output is clip/256 in Q16.16 (equivalently clip in Q24.8), so
+// floor(2^38 / w_q8) is depth; shifting it by six reproduces projection zi.
+wire [31:0] xf_div_q = (SM64_GEOMETRY && !xf_clip) ? {6'd0, rdet_q[31:6]} : rdet_q;
 // zi divisor: max(cam.z, near_clip).  Signed compare (as before); the selected
 // value's bits then become the unsigned divisor, exactly like the old 32-bit reg.
 wire [31:0] xf_recip_divisor = (xf_camz < xf_nearclip) ? xf_nearclip : xf_camz;
@@ -3972,10 +4089,13 @@ task spanprod_prepare_next_record_chunk;
 
         // Consume the first word of the next packed-record chunk and prime
         // ring_rd_data so S_PAY_DATA sees the first record word index.
-        ring_rdptr   <= ring_rdptr + 1'b1;
-        ring_rd_addr <= ring_rdptr + 1'b1;
         pay_idx      <= 6'd31;
-        state        <= S_PAY_DATA;
+        if (GEOMETRY_WORKER && ring_empty) state <= S_PAY_WAIT;
+        else begin
+            ring_rdptr   <= ring_rdptr + 1'b1;
+            ring_rd_addr <= ring_rdptr + 1'b1;
+            state        <= S_PAY_DATA;
+        end
     end
 endtask
 
@@ -4152,11 +4272,10 @@ localparam FBSS_BLEND_LOOKUP   = 4'd13;
 // (unreachable when sp_blend is const 0).
 localparam FBSS_CB_REQ         = 4'd1;   // flush fb_acc, wait drain, issue line read
 localparam FBSS_CB_FILLR       = 4'd14;  // capture the burst into cbw_*, cb_dst_r
-localparam FBSS_CB_RESOLVE     = 4'd3;   // miss path: sums from p3 operands -> IDLE
-localparam FBSS_CB_REFRESH     = 4'd7;   // stale capture: re-derive sums from fb_acc
+localparam FBSS_CB_RESOLVE     = 4'd3;   // miss or stale probe: sums -> IDLE
 reg [3:0] fbss;
-// Miss-path dst halfword captured in FBSS_CB_FILLR so the CB_RESOLVE
-// multiplies run register-to-register (read-response cone split).
+// Destination captured on a miss or when IDLE detects a stale probe, so
+// CB_RESOLVE never puts a framebuffer lane mux ahead of its multipliers.
 reg [15:0] cb_dst_r;
 // Per-channel weighted sums (src*a6 + dst*(64-a6)); loaded at the p2b->p3
 // shift on a window hit (the fold) or by CB_RESOLVE on a miss; consumed by
@@ -4215,14 +4334,14 @@ reg [3:0]  blend_arlen_r;
 //
 // Exactness contract: the window is a pure READ cache and must
 // reflect every prior write.  Three rules enforce that:
-//   1. The fill itself sits behind the same drain-complete barrier
-//      the single-word read used, so nothing is in flight when the
-//      line's words are captured.
+//   1. The fill launches behind the same drain-complete barrier as the
+//      single-word read, so all earlier queued writes have completed.
 //   2. EVERY fbwq push (z, color, clear — all writes go through the
 //      queue) that lands in the window's line invalidates
 //      that word, at push-accept time (before the write can even
 //      reach the queue).  A later test of that word re-reads behind
-//      the barrier.
+//      the barrier. Early restart remembers invalidations until the burst
+//      drains, preventing a later fill beat from revalidating a stale word.
 //   3. The whole window is dropped at every command decode
 //      (S_DECODE) and on soft reset, so CPU-side z-buffer writes
 //      between commands (fence-synchronised) can never be shadowed.
@@ -4237,6 +4356,24 @@ reg [ZW_WORDS-1:0] zw_valid;
 reg [GPU_ADDR_W-ZW_LOW-1:0] zw_base;
 reg [31:0] zw_word [0:ZW_WORDS-1];
 reg [ZW_LG-1:0] zw_fill_beat;
+localparam ZW_EARLY_RESTART = `ifdef INCLUDE_Z_EARLY_RESTART
+                            (GPU_Z_READ_WINDOW > 1);
+                            `else 0; `endif
+`ifdef INCLUDE_Z_PREFETCH
+// Span emission only follows a drained fragment/texture pipeline. Keep this
+// opportunity until its first source pixel is loaded; a later depth miss must
+// use the normal tail path. This avoids a wide live empty-queue decode in the
+// read-launch control and never evicts a line needed by an older fragment.
+reg zw_prefetch_armed;
+always @(posedge clk) begin
+    if (!reset_n || soft_reset) zw_prefetch_armed <= 1'b0;
+    else if (state == S_SPANPROD_EMIT) zw_prefetch_armed <= 1'b1;
+    else if (state != S_FRAG_PIPE || p0a_valid) zw_prefetch_armed <= 1'b0;
+end
+`endif
+reg zw_fill_active;
+reg [ZW_WORDS-1:0] zw_fill_killed;
+wire zw_fill_busy = ZW_EARLY_RESTART && zw_fill_active;
 
 // Registered write snoop (timing: 156 of the 200 worst paths on the first
 // OS30 fit ended at zw_valid — the push-address mux from fb_acc/z_acc/p3
@@ -5041,31 +5178,19 @@ wire        cb_stale_p2b_w = p3_commit_land_w
 // the edge that set the flag).
 wire [15:0] cb_acc_dst_w   = p3_fb_addr[1] ? fb_acc_data[31:16]
                                            : fb_acc_data[15:0];
-// STAGE 2 (p2b->p3 shift) / RESOLVE / REFRESH share one set of 6 multiplies,
+// STAGE 2 (p2b->p3 shift) / RESOLVE share one set of 6 multiplies,
 // operand-muxed on REGISTERED STATE COMPARES only — a multi-term refresh
 // decode ahead of the multipliers cost -1.5 ns (sp_truecolor -> cb_sr), so
-// the stale refresh is a 1-cycle FSM state like RESOLVE, not an IDLE-cycle
-// special case.
-`ifdef INCLUDE_CB_REFRESH_PIPE
-// Refresh selects the accumulator half into cb_dst_r first.  RESOLVE then
-// shares the normal multipliers without a framebuffer lane mux at their input.
+// IDLE captures a stale probe's destination before entering RESOLVE.  This
+// separates lane selection from arithmetic without adding a refresh cycle.
 wire [15:0] cbm_src_w   = (fbss == FBSS_CB_RESOLVE) ? p3_color : p2b_color;
 wire [15:0] cbm_dst_w   = (fbss == FBSS_CB_RESOLVE) ? cb_dst_r : p2b_cb_dst;
-`else
-wire [15:0] cbm_src_w   = (fbss == FBSS_CB_RESOLVE || fbss == FBSS_CB_REFRESH)
-                        ? p3_color : p2b_color;
-wire [15:0] cbm_dst_w   = (fbss == FBSS_CB_REFRESH) ? cb_acc_dst_w
-                        : (fbss == FBSS_CB_RESOLVE) ? cb_dst_r
-                        :                             p2b_cb_dst;
-`endif
 `ifdef INCLUDE_CB_SPLIT_MULT
 // Spare DSPs separate normal fragments from parked blend misses.  Selecting
 // the completed sums keeps the FSM operand mux off the multiplier inputs.
 reg [6:0] cb_inv_a6; // Span-constant destination weight, captured with sp_a6.
-wire [15:0] cb_slow_dst_w = `ifdef INCLUDE_CB_REFRESH_PIPE cb_dst_r;
-                          `else (fbss == FBSS_CB_REFRESH) ? cb_acc_dst_w : cb_dst_r;
-                          `endif
-wire cb_slow_sum_w = (fbss == FBSS_CB_RESOLVE || fbss == FBSS_CB_REFRESH);
+wire [15:0] cb_slow_dst_w = cb_dst_r;
+wire cb_slow_sum_w = (fbss == FBSS_CB_RESOLVE);
 wire [12:0] cb_fast_r_w = p2b_color[15:11] * sp_a6 + p2b_cb_dst[15:11] * cb_inv_a6;
 wire [12:0] cb_fast_g_w = p2b_color[10:5] * sp_a6 + p2b_cb_dst[10:5] * cb_inv_a6;
 wire [12:0] cb_fast_b_w = p2b_color[4:0] * sp_a6 + p2b_cb_dst[4:0] * cb_inv_a6;
@@ -5171,11 +5296,11 @@ generate if (GPU_STREAM_PIPE) begin : tex_stream
     // needs, and without its 110-bit lookup copy.
     (* ramstyle = "MLAB, no_rw_check" *) reg [REQ_W-1:0] requests [0:3];
     (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] results [0:3];
-    (* ramstyle = "MLAB, no_rw_check" *) reg [TEX_META_W-1:0] metas [0:7];
+    localparam META_IN_MLAB = !SINGLE_CLIP_VERTEX;
 `else
     (* ramstyle = "M10K, no_rw_check" *) reg [REQ_W-1:0] requests [0:3];
     (* ramstyle = "M10K, no_rw_check" *) reg [15:0] results [0:3];
-    (* ramstyle = "M10K, no_rw_check" *) reg [TEX_META_W-1:0] metas [0:7];
+    localparam META_IN_MLAB = 0;
 `endif
     reg [1:0] req_rd, req_wr, res_rd, res_wr;
     reg [2:0] meta_rd, meta_wr;
@@ -5195,10 +5320,24 @@ generate if (GPU_STREAM_PIPE) begin : tex_stream
     reg [15:0] res_raw, res_forward;
     reg [TEX_META_W-1:0] meta_raw;
     reg req_forward_valid, res_forward_valid;
+    // Single-vertex projection releases three coordinate M10Ks. Reuse them
+    // for this wide FIFO; the read/write schedule and queue depth stay identical.
+    if (META_IN_MLAB) begin : meta_mlab
+        (* ramstyle = "MLAB, no_rw_check" *) reg [TEX_META_W-1:0] metas [0:7];
+        always @(posedge clk) begin
+            if (req_push) metas[meta_wr] <= p0_tex_meta;
+            meta_raw <= metas[meta_next];
+        end
+    end else begin : meta_m10k
+        (* ramstyle = "M10K, no_rw_check" *) reg [TEX_META_W-1:0] metas [0:7];
+        always @(posedge clk) begin
+            if (req_push) metas[meta_wr] <= p0_tex_meta;
+            meta_raw <= metas[meta_next];
+        end
+    end
     always @(posedge clk) begin
         req_raw <= requests[req_next];
         res_raw <= results[res_next];
-        meta_raw <= metas[meta_next];
         req_forward <= {fp_tex_addr_full, sp_truecolor};
         res_forward <= res_data;
         req_forward_valid <= req_push && (req_wr == req_next);
@@ -5219,7 +5358,6 @@ generate if (GPU_STREAM_PIPE) begin : tex_stream
     always @(posedge clk) begin
         if (req_push) begin
             requests[req_wr] <= {fp_tex_addr_full, sp_truecolor};
-            metas[meta_wr] <= p0_tex_meta;
         end
         if (res_push)
             results[res_wr] <= res_data;
@@ -5817,7 +5955,26 @@ wire p2b_zf_fold = p2b_valid && p2b_z_test && !p2b_discard
 wire [31:0] p2b_zf_window_word = (GPU_Z_READ_WINDOW > 1)
                                 ? zw_word[p2b_z_word_addr_w[ZW_LOW-1:2]] : 32'd0;
 wire p2b_zf_acc_pass = p2b_z_value >= (p2b_z_addr[1] ? z_acc_hi : z_acc_lo);
+`ifdef INCLUDE_Z_WINDOW_PREDECODE
+// Decode the window halfword at p2 -> p2b, while keeping the data live.
+// A fill or snoop may change the window during a pipeline stall, so only
+// the address is registered. Tags, validity and accumulator forwarding are
+// still evaluated in p2b on the original cycle.
+(* keep *) reg [2*ZW_WORDS-1:0] p2b_zw_half_select;
+reg [15:0] p2b_zf_window_half;
+integer zw_half_idx;
+always @* begin
+    p2b_zf_window_half = 16'd0;
+    for (zw_half_idx = 0; zw_half_idx < 2*ZW_WORDS; zw_half_idx = zw_half_idx + 1)
+        p2b_zf_window_half = p2b_zf_window_half |
+            ({16{p2b_zw_half_select[zw_half_idx]}} &
+             (zw_half_idx % 2 ? zw_word[zw_half_idx/2][31:16]
+                             : zw_word[zw_half_idx/2][15:0]));
+end
+wire p2b_zf_window_pass = p2b_z_value >= p2b_zf_window_half;
+`else
 wire p2b_zf_window_pass = p2b_z_value >= fb_halfword_read(p2b_zf_window_word, p2b_z_addr[1]);
+`endif
 wire p2b_zf_pass = p2b_zf_acc_hit ? p2b_zf_acc_pass : p2b_zf_window_pass;
 `else
 wire p2b_zf_pass = (p2b_z_value >= p2b_zf_old_half);
@@ -6033,6 +6190,8 @@ always @(posedge clk) begin : main_fsm
         tri_fill_idx <= 3'd0;
         cmd_is_flip <= 0;
         cmd_class <= CMDCLS_NONE;
+        geometry_cull <= 2'b00;
+        geometry_sort_odd <= 1'b0;
         spanprod_compact_direct <= 1'b0;
         m_wr_inflight       <= 4'b0;
         gpu_swap_req        <= 1'b0;
@@ -6077,6 +6236,11 @@ always @(posedge clk) begin : main_fsm
         p2b_valid <= 0; p2b_color <= 0; p2b_flags <= 0;
         p2b_fb_addr <= 0; p2b_discard <= 0;
         p2b_z_test <= 0; p2b_z_write <= 0; p2b_z_addr <= 0; p2b_z_value <= 0;
+`ifdef INCLUDE_Z_WINDOW_PREDECODE
+`ifdef INCLUDE_Z_COMPARE_PARALLEL
+        p2b_zw_half_select <= 0;
+`endif
+`endif
         p3_valid <= 0; p3_color <= 0; p3_flags <= 0;
         p3_fb_addr <= 0; p3_discard <= 0;
         p3_z_test <= 0; p3_z_write <= 0; p3_z_addr <= 0; p3_z_value <= 0;
@@ -6097,6 +6261,8 @@ always @(posedge clk) begin : main_fsm
         zw_valid         <= 4'b0;
         zw_base          <= 0;
         zw_fill_beat     <= 2'd0;
+        zw_fill_active   <= 1'b0;
+        zw_fill_killed   <= 0;
         zw_snoop_pending <= 1'b0;
         cbw_valid        <= 4'b0;
         cbw_base         <= {(GPU_ADDR_W-CBW_LOW){1'b0}};
@@ -6215,8 +6381,8 @@ always @(posedge clk) begin : main_fsm
         // Soft reset: return FSM to idle, deassert all bus signals
         if (soft_reset) begin
             state        <= S_IDLE;
-            ring_rdptr   <= ring_wrptr;
-            ring_rd_addr <= ring_wrptr;
+            ring_rdptr   <= GEOMETRY_WORKER ? 12'd0 : ring_wrptr;
+            ring_rd_addr <= GEOMETRY_WORKER ? 12'd0 : ring_wrptr;
             m_wr_awvalid <= 0;
             m_wr_wvalid  <= 0;
             fbwq_rd_ptr  <= 4'b0;
@@ -6272,6 +6438,8 @@ always @(posedge clk) begin : main_fsm
             blend_arlen_r <= 2'd0;
             zw_valid      <= 4'b0;
             zw_fill_beat  <= 2'd0;
+            zw_fill_active <= 1'b0;
+            zw_fill_killed <= 0;
             zw_snoop_pending <= 1'b0;
             cbw_valid     <= 4'b0;
             cbw_fill_beat <= 2'd0;
@@ -6457,6 +6625,7 @@ always @(posedge clk) begin : main_fsm
         // Decode — start reading payload words from BRAM
         // ============================================================
         S_DECODE: begin
+            geometry_cull <= 2'b00;
             // Pre-decode cmd_type into one-hot dispatch flags. The case
             // expression in S_EXECUTE used to compare cmd_type directly,
             // which built a long combinational chain into the per-command
@@ -6478,11 +6647,14 @@ always @(posedge clk) begin : main_fsm
             // the S_PAY_DATA default arm (payload drains word-by-word via
             // pay_remaining, no destination writes) and the S_EXECUTE
             // `default: state <= S_IDLE` — the exact unrecognised-command
-            // no-op drain path.  Long-form payloads (>=33 words) decode
-            // identically in both configs.
+            // no-op drain path. Long-form payloads (>=33 words) have their
+            // own gate, so os30 can omit the header/record input while
+            // retaining the triangle-fed span producer.
             cmd_is_draw_param_span_list <=
-                (cmd_type == CMD_DRAW_PARAM_SPAN_LIST && cmd_payload_words >=
-                 ((INCLUDE_COMPACT_SPAN != 0) ? 13'd11 : 13'd33));
+                (cmd_type == CMD_DRAW_PARAM_SPAN_LIST) &&
+                (((INCLUDE_PARAM_SPAN_LIST != 0) && cmd_payload_words >= 13'd33)
+                 || ((INCLUDE_COMPACT_SPAN != 0) && cmd_payload_words >= 13'd11
+                     && cmd_payload_words <= 13'd32));
             // Decode dedup: 0x4C reuses the 0x48 compact-direct case arms of
             // load_param_span_list_payload_word through the 5-word->7-word
             // index remap (column_compact_idx_remap), so the column decode
@@ -6593,7 +6765,7 @@ always @(posedge clk) begin : main_fsm
             cmd_is_set_object_state <= (INCLUDE_VERT_TRI != 0) &&
                 ((INCLUDE_GPU_XFORM_MAC != 0) || (INCLUDE_XFORM_RGB != 0) || (INCLUDE_CLIP_TRI != 0)) &&
                 (cmd_type == CMD_SET_OBJECT_STATE && cmd_payload_words == 13'd26);
-            cmd_is_draw_xform_tri <= (INCLUDE_VERT_TRI != 0) && (INCLUDE_GPU_XFORM_MAC != 0) &&
+            cmd_is_draw_xform_tri <= !SM64_GEOMETRY && (INCLUDE_VERT_TRI != 0) && (INCLUDE_GPU_XFORM_MAC != 0) &&
                 (cmd_type == CMD_DRAW_XFORM_TRI && cmd_payload_words == 13'd16);
             // T1: 0x52 truecolor transform tri.  18-word payload: 3 verts {x,y,z}
             // + 3 {s,t} + 3 RGB565.  GPU computes zi+depth (no per-draw zi/depth
@@ -6602,7 +6774,7 @@ always @(posedge clk) begin : main_fsm
             // runs the zeroed matrix and silently draws nothing (review finding).
             // Gated out it falls to CMDCLS_NONE and drains as a clean no-op,
             // exactly like 0x51 always has.
-            cmd_is_draw_xform_tri_rgb <= (INCLUDE_VERT_TRI != 0) && (INCLUDE_DIRECT_COLOR != 0) &&
+            cmd_is_draw_xform_tri_rgb <= !SM64_GEOMETRY && (INCLUDE_VERT_TRI != 0) && (INCLUDE_DIRECT_COLOR != 0) &&
                 (INCLUDE_XFORM_RGB != 0) && (INCLUDE_GPU_XFORM_MAC != 0) &&
                 (cmd_type == CMD_DRAW_XFORM_TRI_RGB && cmd_payload_words == 13'd18);
             // Clip-space feed (0x4F): wire-identical to 0x52 (18w), but the 3
@@ -6614,7 +6786,7 @@ always @(posedge clk) begin : main_fsm
             // T3: 0x53 LOAD_VERTS (header word + up to 8 verts x 6 words -> <=49
             // payload words, fits the 6-bit pay_idx) and 0x54 DRAW_INDEXED_TRI
             // (1 word: 3 cache indices).  Gated on the vertex cache.
-            cmd_is_load_verts <= (INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0) &&
+            cmd_is_load_verts <= !SM64_GEOMETRY && (INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0) &&
                 (INCLUDE_GPU_XFORM_MAC != 0) &&
                 (cmd_type == CMD_LOAD_VERTS &&
                  cmd_payload_words >= 13'd7 && cmd_payload_words <= 13'd49);
@@ -6623,10 +6795,11 @@ always @(posedge clk) begin : main_fsm
             // XF_CLIP_FEED (recip+project only), so this deliberately has NO
             // MAC term: it is the load path for MAC-less configs and for hosts
             // that pre-transform (Quake2 CPU geometry).
-            cmd_is_load_vert_clip <= (INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0) &&
+            cmd_is_load_vert_clip <= !GEOMETRY_WORKER && (INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0) &&
                 (cmd_type == CMD_LOAD_VERT_CLIP && cmd_payload_words == 13'd8);
             cmd_is_draw_indexed_tri <= (INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0) &&
-                (cmd_type == CMD_DRAW_INDEXED_TRI && cmd_payload_words == 13'd1);
+                ((cmd_type == CMD_DRAW_INDEXED_TRI
+                  || (SM64_GEOMETRY && !GEOMETRY_WORKER && cmd_type == CMD_DRAW_GEOMETRY_TRI)) && cmd_payload_words == 13'd1);
             // T4: 0x55 SET_LIGHT_STATE sticky (6 words: dir x/y/z, light RGB565,
             // ambient RGB565, enable/count).
             cmd_is_set_light_state <= (INCLUDE_GPU_LIGHT != 0) && (INCLUDE_XFORM_RGB != 0) &&
@@ -6651,8 +6824,11 @@ always @(posedge clk) begin : main_fsm
                 CMD_SET_FB:      cmd_class <= CMDCLS_SET_FB;
                 CMD_SET_TEXTURE: cmd_class <= CMDCLS_SET_TEXTURE;
                 CMD_DRAW_PARAM_SPAN_LIST:
-                    cmd_class <= (cmd_payload_words >=
-                                  ((INCLUDE_COMPACT_SPAN != 0) ? 13'd11 : 13'd33))
+                    cmd_class <= (((INCLUDE_PARAM_SPAN_LIST != 0)
+                                   && cmd_payload_words >= 13'd33)
+                                  || ((INCLUDE_COMPACT_SPAN != 0)
+                                      && cmd_payload_words >= 13'd11
+                                      && cmd_payload_words <= 13'd32))
                                ? CMDCLS_SPAN_COL : CMDCLS_NONE;
                 CMD_DRAW_COLUMN_LIST:
                     cmd_class <= ((INCLUDE_COLUMN_LIST_EFF != 0)
@@ -6687,11 +6863,11 @@ always @(posedge clk) begin : main_fsm
                                   && cmd_payload_words == 13'd26)
                                ? CMDCLS_SET_OBJECT_STATE : CMDCLS_NONE;
                 CMD_DRAW_XFORM_TRI:
-                    cmd_class <= ((INCLUDE_VERT_TRI != 0) && (INCLUDE_GPU_XFORM_MAC != 0)
+                    cmd_class <= (!SM64_GEOMETRY && (INCLUDE_VERT_TRI != 0) && (INCLUDE_GPU_XFORM_MAC != 0)
                                   && cmd_payload_words == 13'd16)
                                ? CMDCLS_XFORM_TRI : CMDCLS_NONE;
                 CMD_DRAW_XFORM_TRI_RGB:
-                    cmd_class <= ((INCLUDE_VERT_TRI != 0) && (INCLUDE_DIRECT_COLOR != 0)
+                    cmd_class <= (!SM64_GEOMETRY && (INCLUDE_VERT_TRI != 0) && (INCLUDE_DIRECT_COLOR != 0)
                                   && (INCLUDE_XFORM_RGB != 0) && (INCLUDE_GPU_XFORM_MAC != 0)
                                   && cmd_payload_words == 13'd18)
                                ? CMDCLS_XFORM_RGB_CLIP : CMDCLS_NONE;
@@ -6701,17 +6877,24 @@ always @(posedge clk) begin : main_fsm
                                   && cmd_payload_words == 13'd18)
                                ? CMDCLS_XFORM_RGB_CLIP : CMDCLS_NONE;
                 CMD_LOAD_VERTS:
-                    cmd_class <= ((INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0)
+                    cmd_class <= (!SM64_GEOMETRY && (INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0)
                                   && (INCLUDE_GPU_XFORM_MAC != 0)
                                   && cmd_payload_words >= 13'd7
                                   && cmd_payload_words <= 13'd49)
                                ? CMDCLS_LOAD_VERTS : CMDCLS_NONE;
                 CMD_LOAD_VERT_CLIP:
-                    cmd_class <= ((INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0)
+                    cmd_class <= (!GEOMETRY_WORKER && (INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0)
                                   && cmd_payload_words == 13'd8)
                                ? CMDCLS_LOAD_VERT_CLIP : CMDCLS_NONE;
+                CMD_LOAD_PROJECTED:
+                    cmd_class <= (GEOMETRY_WORKER && INCLUDE_VTX_CACHE && cmd_payload_words == 13'd6)
+                               ? CMDCLS_PROJECTED : CMDCLS_NONE;
                 CMD_DRAW_INDEXED_TRI:
                     cmd_class <= ((INCLUDE_VTX_CACHE != 0) && (INCLUDE_XFORM_RGB != 0)
+                                  && cmd_payload_words == 13'd1)
+                               ? CMDCLS_INDEXED_TRI : CMDCLS_NONE;
+                CMD_DRAW_GEOMETRY_TRI:
+                    cmd_class <= (SM64_GEOMETRY && !GEOMETRY_WORKER && INCLUDE_VTX_CACHE && INCLUDE_XFORM_RGB
                                   && cmd_payload_words == 13'd1)
                                ? CMDCLS_INDEXED_TRI : CMDCLS_NONE;
                 CMD_SET_LIGHT_STATE:
@@ -6723,6 +6906,13 @@ always @(posedge clk) begin : main_fsm
                                   && (INCLUDE_XFORM_RGB != 0) && (INCLUDE_GPU_XFORM_MAC != 0)
                                   && cmd_payload_words == 13'd9)
                                ? CMDCLS_LOAD_VERT_LIT : CMDCLS_NONE;
+                CMD_LOAD_GEOMETRY:
+                    cmd_class <= (SM64_GEOMETRY && INCLUDE_GPU_XFORM_MAC
+                                  && INCLUDE_VTX_CACHE && tri_state_valid
+                                  && (cmd_payload_words == 13'd5
+                                      || cmd_payload_words == 13'd10
+                                      || cmd_payload_words == 13'd15))
+                               ? CMDCLS_GEOMETRY : CMDCLS_NONE;
                 default:         cmd_class <= CMDCLS_NONE;
             endcase
 
@@ -6736,9 +6926,12 @@ always @(posedge clk) begin : main_fsm
                 // accepts.
                 pay_remaining <= cmd_payload_words;
                 // Start first BRAM read (data arrives next cycle)
-                ring_rdptr <= ring_rdptr + 1'b1;
-                ring_rd_addr <= ring_rdptr + 1'b1;
-                state <= S_PAY_DATA;
+                if (GEOMETRY_WORKER && ring_empty) state <= S_PAY_WAIT;
+                else begin
+                    ring_rdptr <= ring_rdptr + 1'b1;
+                    ring_rd_addr <= ring_rdptr + 1'b1;
+                    state <= S_PAY_DATA;
+                end
             end
         end
 
@@ -6752,6 +6945,13 @@ always @(posedge clk) begin : main_fsm
         // Destinations live in regs that already exist, so the only storage
         // cost is the payload index counter and pay_remaining.
         //
+        S_PAY_WAIT: begin
+            if (!ring_empty) begin
+                ring_rdptr <= ring_rdptr + 1'b1;
+                ring_rd_addr <= ring_rdptr + 1'b1;
+                state <= S_PAY_DATA;
+            end
+        end
         S_PAY_DATA: begin
             if (pay_idx != 6'd63)
                 pay_idx <= pay_idx + 6'd1;
@@ -6794,6 +6994,8 @@ always @(posedge clk) begin : main_fsm
                 if (pay_idx == 6'd1) st_fb_stride <= ring_rd_data[15:0];
             end
             CMDCLS_SPAN_COL, CMDCLS_PARAM_TRI: begin
+                if (INCLUDE_PARAM_SPAN_LIST || INCLUDE_COMPACT_SPAN ||
+                    INCLUDE_COLUMN_LIST_EFF || INCLUDE_PARAM_TRI) begin
                 // Staging-dedup contract: tri_state_valid is cleared in
                 // S_DECODE on the raw opcode/size ranges (variant-invariant
                 // — see the comment there), not here, so lean variants that
@@ -6839,6 +7041,7 @@ always @(posedge clk) begin : main_fsm
                         tri_v2_x <= ring_rd_data[15:0];
                         tri_v2_y <= ring_rd_data[31:16];
                     end
+                end
                 end
             end
             CMDCLS_SET_TRI_STATE: begin
@@ -6940,8 +7143,8 @@ always @(posedge clk) begin : main_fsm
                         // per-triangle Q29 override: bit5 = q29 enable, [4:0] =
                         // shared attr shift (the CPU magnitude estimate).  w13==0
                         // keeps the legacy Q16.16 derive (fully backward-compat).
-                        vt_q29_en    <= ring_rd_data[5];
-                        vt_q29_shift <= ring_rd_data[4:0];
+                        vt_q29_en    <= EFF_Q29 && ring_rd_data[5];
+                        vt_q29_shift <= EFF_Q29 ? ring_rd_data[4:0] : 5'd0;
                     end
                     default: ;
                 endcase
@@ -7022,9 +7225,9 @@ always @(posedge clk) begin : main_fsm
                     6'd24: xf_nearclip <= ring_rd_data;
                     6'd25: begin
                         // w25: [2:0]=row count, [3]=q29 enable (world), [8:4]=shift
-                        xf_rows      <= ring_rd_data[2:0];
-                        xf_q29_en    <= ring_rd_data[3];
-                        xf_q29_shift <= ring_rd_data[8:4];
+                        xf_rows      <= SM64_GEOMETRY ? 3'd3 : ring_rd_data[2:0];
+                        xf_q29_en    <= EFF_Q29 && ring_rd_data[3];
+                        xf_q29_shift <= EFF_Q29 ? ring_rd_data[8:4] : 5'd0;
                     end
                     default: ;
                 endcase
@@ -7113,15 +7316,24 @@ always @(posedge clk) begin : main_fsm
                 // transforms it and writes the slot (see XF_PROJ_LAUNCH).
                 case (pay_idx)
                     6'd0: xf_load_slot <= ring_rd_data[4:0];
+                    6'd1: begin
+                        if (SINGLE_CLIP_VERTEX) xf_camx <= ring_rd_data;
 `ifndef INCLUDE_XFORM_VERTEX_RAM
-                    6'd1: xf_vx[0] <= ring_rd_data;
+                        else xf_vx[0] <= ring_rd_data;
 `endif
+                    end
+                    6'd2: begin
+                        if (SINGLE_CLIP_VERTEX) xf_camy <= ring_rd_data;
 `ifndef INCLUDE_XFORM_VERTEX_RAM
-                    6'd2: xf_vy[0] <= ring_rd_data;
+                        else xf_vy[0] <= ring_rd_data;
 `endif
+                    end
+                    6'd3: begin
+                        if (SINGLE_CLIP_VERTEX) xf_camz <= ring_rd_data;
 `ifndef INCLUDE_XFORM_VERTEX_RAM
-                    6'd3: xf_vz[0] <= ring_rd_data;
+                        else xf_vz[0] <= ring_rd_data;
 `endif
+                    end
                     6'd4: dv_szi[0] <= ring_rd_data;   // raw s (rows==3 passthrough)
                     6'd5: dv_tzi[0] <= ring_rd_data;   // raw t
                     6'd6: begin vt_rrow[0] <= ring_rd_data[15:11];
@@ -7144,7 +7356,48 @@ always @(posedge clk) begin : main_fsm
                     vc_i0 <= ring_rd_data[4:0];
                     vc_i1 <= ring_rd_data[9:5];
                     vc_i2 <= ring_rd_data[14:10];
+                    if (SM64_GEOMETRY && !GEOMETRY_WORKER && cmd_type == CMD_DRAW_GEOMETRY_TRI)
+                        geometry_cull <= ring_rd_data[16:15];
                 end
+            end
+            CMDCLS_PROJECTED: if (GEOMETRY_WORKER) begin
+                case (pay_idx)
+                    0: begin xf_load_slot <= ring_rd_data[4:0];
+                             vt_rrow[0] <= ring_rd_data[31:27];
+                             vt_lrow[0] <= ring_rd_data[26:21];
+                             vt_brow[0] <= ring_rd_data[20:16]; end
+                    1: begin xf_sx[0] <= ring_rd_data[15:0]; xf_sy[0] <= ring_rd_data[31:16]; end
+                    2: vt_zi[0] <= ring_rd_data;
+                    3: dv_szi[0] <= ring_rd_data;
+                    4: dv_tzi[0] <= ring_rd_data;
+                    5: xf_load_depth <= ring_rd_data;
+                    default: ;
+                endcase
+            end
+            CMDCLS_GEOMETRY: if (SM64_GEOMETRY) begin
+                // Five words per vertex: slot, packed signed x/y, signed z
+                // plus RGB565, s, t. Matrix coefficients are Q8.24; translation
+                // is Q24.8. Existing (sum >> 16) + translation produces clip*256.
+                case (pay_idx)
+                    6'd0: xf_load_slot <= ring_rd_data[4:0];
+`ifndef INCLUDE_XFORM_VERTEX_RAM
+                    6'd1: begin
+                        xf_vx[0] <= {{16{ring_rd_data[15]}}, ring_rd_data[15:0]};
+                        xf_vy[0] <= {{16{ring_rd_data[31]}}, ring_rd_data[31:16]};
+                    end
+`endif
+                    6'd2: begin
+`ifndef INCLUDE_XFORM_VERTEX_RAM
+                        xf_vz[0] <= {{16{ring_rd_data[15]}}, ring_rd_data[15:0]};
+`endif
+                        vt_rrow[0] <= ring_rd_data[31:27];
+                        vt_lrow[0] <= ring_rd_data[26:21];
+                        vt_brow[0] <= ring_rd_data[20:16];
+                    end
+                    6'd3: dv_szi[0] <= ring_rd_data;
+                    6'd4: dv_tzi[0] <= ring_rd_data;
+                    default: ;
+                endcase
             end
             CMDCLS_SET_LIGHT_STATE: begin
                 // T4 0x55 sticky: light dir (Q16.16), light colour + ambient
@@ -7226,6 +7479,9 @@ always @(posedge clk) begin : main_fsm
             if (pay_remaining <= 13'd1) begin
                 state <= S_EXECUTE;
             end
+            else if (SM64_GEOMETRY && cmd_class == CMDCLS_GEOMETRY && pay_idx == 6'd4) begin
+                state <= S_EXECUTE;
+            end
             // For long packed-record param lists, execute the current 4-record
             // chunk and return here to consume the next record chunk without
             // requiring a new surface header.
@@ -7237,9 +7493,14 @@ always @(posedge clk) begin : main_fsm
                 state <= S_EXECUTE;
             end
             else begin
-                // Advance rdptr for next word (BRAM read, 1-cycle latency)
-                ring_rdptr <= ring_rdptr + 1'b1;
-                ring_rd_addr <= ring_rdptr + 1'b1;
+                // A worker may be blocked behind its small output queue or
+                // awaiting another published CPU word. Consume each payload
+                // word once, then wait before issuing an unavailable read.
+                if (GEOMETRY_WORKER && ring_empty) state <= S_PAY_WAIT;
+                else begin
+                    ring_rdptr <= ring_rdptr + 1'b1;
+                    ring_rd_addr <= ring_rdptr + 1'b1;
+                end
             end
         end
 
@@ -7298,6 +7559,8 @@ always @(posedge clk) begin : main_fsm
                 state <= S_CLEAR_RECT;
             end
             CMDCLS_SPAN_COL: begin
+                if (INCLUDE_PARAM_SPAN_LIST || INCLUDE_COMPACT_SPAN ||
+                    INCLUDE_COLUMN_LIST_EFF) begin
                 // Shared spanprod bring-up.  The 0x4C column list lands its
                 // (s/sstep-forced-0) direct-affine staging via its own loader,
                 // then reuses this EXECUTE / S_SPANPROD path byte-for-byte —
@@ -7315,7 +7578,8 @@ always @(posedge clk) begin : main_fsm
                              && (spanprod_record_count != 3'd0);
 	                state <= (spanprod_header_supported && (spanprod_record_count != 3'd0))
 	                       ? S_SPANPROD_SELECT : S_IDLE;
-	            end
+                end else state <= S_IDLE;
+            end
             CMDCLS_PARAM_TRI: begin
                 // Same spanprod bring-up as the span list, but records come
                 // from the edge walker via S_TRI_FILL instead of the ring.
@@ -7435,7 +7699,8 @@ always @(posedge clk) begin : main_fsm
                 // the matrix MAC and enter at XF_CLIP_FEED (recip+project only).
                 // Needs the 0x4A sticky surface state (same as 0x4B) — refuse if
                 // not armed.  0x52/0x4F additionally derive RGB/depth (sp_rgb).
-                if ((INCLUDE_VERT_TRI != 0) && tri_state_valid) begin
+                if (!SM64_GEOMETRY && (INCLUDE_VERT_TRI != 0) && tri_state_valid
+                    && ((INCLUDE_GPU_XFORM_MAC != 0) || (INCLUDE_CLIP_TRI != 0))) begin
                     xf_vtx      <= 2'd0;
                     xf_row      <= 2'd0;
                     xf_idx      <= 2'd0;
@@ -7450,11 +7715,18 @@ always @(posedge clk) begin : main_fsm
                     state <= S_IDLE;
                 end
             end
-            CMDCLS_LOAD_VERTS: begin
+            CMDCLS_PROJECTED: begin
+                if (GEOMETRY_WORKER && INCLUDE_VTX_CACHE && tri_state_valid)
+                    vc_mem[xf_load_slot] <= {vt_brow[0],vt_lrow[0],vt_rrow[0],
+                        xf_load_depth,dv_tzi[0],dv_szi[0],vt_zi[0],xf_sy[0],xf_sx[0]};
+                state <= S_IDLE;
+            end
+            CMDCLS_LOAD_VERTS, CMDCLS_GEOMETRY: begin
                 // T3 0x53: transform ONE vert through S_XFORM and write the cache
                 // slot (XF_PROJ_LAUNCH branches on xf_to_cache).  Needs the 0x4A
                 // sticky surface + the 0x50 sticky matrix, same as 0x52.
-                if ((INCLUDE_VTX_CACHE != 0) && tri_state_valid) begin
+                if ((INCLUDE_VTX_CACHE != 0) && (INCLUDE_GPU_XFORM_MAC != 0)
+                    && tri_state_valid) begin
                     xf_vtx      <= 2'd0;
                     xf_row      <= 2'd0;
                     xf_idx      <= 2'd0;
@@ -7488,7 +7760,7 @@ always @(posedge clk) begin : main_fsm
                     xf_lit      <= 1'b0;
                     xf_clip     <= 1'b1;   // multi-vert-safe if last_vtx ever grows
                     xf_last_vtx <= 2'd0;
-                    xf_state    <= XF_CLIP_ENTRY;
+                    xf_state    <= SINGLE_CLIP_VERTEX ? XF_RECIP_INIT : XF_CLIP_ENTRY;
                     state       <= S_XFORM;
                 end else begin
                     state <= S_IDLE;
@@ -7496,7 +7768,8 @@ always @(posedge clk) begin : main_fsm
             end
             CMDCLS_LOAD_VERT_LIT: begin
                 // T4 0x57: transform + light one vert -> cache slot.
-                if ((INCLUDE_GPU_LIGHT != 0) && (INCLUDE_VTX_CACHE != 0) && tri_state_valid) begin
+                if ((INCLUDE_GPU_LIGHT != 0) && (INCLUDE_VTX_CACHE != 0)
+                    && (INCLUDE_GPU_XFORM_MAC != 0) && tri_state_valid) begin
                     xf_vtx      <= 2'd0;
                     xf_row      <= 2'd0;
                     xf_idx      <= 2'd0;
@@ -7576,6 +7849,7 @@ always @(posedge clk) begin : main_fsm
                 //      dvy[dv_ord[s]].  DRV_SORT_A loads + compare-swap (slot0,1);
                 //      DRV_SORT_B (slot1,2); DRV_SORT_C (slot0,1).
                 DRV_SORT_A: begin : drv_sort_a_blk
+                    geometry_sort_odd <= (tri_v1_y < tri_v0_y);
                     // Seed the order and apply the first compare-swap in one
                     // cycle.  Staging-dedup: dv_szi/dv_tzi already hold the
                     // s*zi / t*zi products (folded during payload arrival), so
@@ -7592,6 +7866,7 @@ always @(posedge clk) begin : main_fsm
                 DRV_SORT_B: begin
                     // compare-swap (slot1,slot2)
                     if (dvy[dv_ord[2]] < dvy[dv_ord[1]]) begin
+                        geometry_sort_odd <= !geometry_sort_odd;
                         dv_ord[1] <= dv_ord[2];
                         dv_ord[2] <= dv_ord[1];
                     end
@@ -7605,6 +7880,7 @@ always @(posedge clk) begin : main_fsm
                     // arrival).  These run before the edge-delta stage, inside the
                     // walker's idle setup window — free in throughput.
                     if (dvy[dv_ord[1]] < dvy[dv_ord[0]]) begin
+                        geometry_sort_odd <= !geometry_sort_odd;
                         dv_ord[0] <= dv_ord[1];
                         dv_ord[1] <= dv_ord[0];
                     end
@@ -7735,43 +8011,46 @@ always @(posedge clk) begin : main_fsm
                         dd_detsign <= 1'b0;
                     end
                     dstate <= DRV_RDET;
-                    rdet_cnt <= 6'd46;   // beat 46 loads operands, 45..1 iterate
-                    rdet_q   <= 32'd0;
+                    rdet_cnt <= 6'd46;   // load sentinel; then 45 or 32 iterations
                     rdet_rem <= 35'd0;
                     rdet_ovf <= 1'b0;
-                    rdet_dividend <= 45'd0;
+                    rdet_dq       <= 45'd0;
                     rdet_divisor  <= 35'd0;
+                    // The y-sort permutation changes determinant sign. Undo
+                    // that parity before testing original screen winding.
+                    // Delay walker launch until here for culled indexed draws.
+                    if (SM64_GEOMETRY && cmd_is_draw_indexed_tri && geometry_cull != 0) begin
+                        if (det_now == 0
+                            || geometry_cull == 2'b11
+                            || (geometry_cull[0] && (det_now[34] ^ geometry_sort_odd))
+                            || (geometry_cull[1] && !(det_now[34] ^ geometry_sort_odd))) begin
+                            spanprod_active <= 1'b0;
+                            tri_start <= 1'b0;
+                            state <= S_IDLE;
+                        end else tri_start <= 1'b1;
+                    end
                 end
                 // ---- serial restoring divide: rdet = round(2^N/|det|) ----
                 DRV_RDET: begin
                     if (rdet_cnt == 6'd46) begin
-                        rdet_small <= spanprod_subpix_y && !vt_q29_en
-                                   && (dd_detabs <= 35'd8192);
-                        rdet_dividend <= ({10'd0, dd_detabs} >> 1)
-                            + ((spanprod_subpix_y && !vt_q29_en
-                                && (dd_detabs <= 35'd8192))
-                               ? (45'd1 << 31) : (45'd1 << DERIV_N));
+                        rdet_small <= rdet_small_input;
+                        // Q31 + (|det| >> 1) fits in 32 bits for |det| <= 8192.
+                        // Skip the thirteen leading zero bits, aligning the
+                        // first live dividend bit with the shared bit-44 tap.
+                        rdet_dq <= rdet_small_input
+                                 ? {rdet_numerator[31:0], 13'd0} : rdet_numerator;
                         rdet_divisor  <= dd_detabs;
                         rdet_rem      <= 35'd0;
-                        rdet_q        <= 32'd0;
                         rdet_ovf      <= 1'b0;
-                        rdet_cnt      <= rdet_cnt - 6'd1;
+                        rdet_cnt      <= rdet_small_input ? 6'd32 : 6'd45;
                     end else begin : drv_rdet_iter
-                        // Next quotient value after shifting in this beat's bit.
-                        reg [31:0] q_next;
-                        q_next = {rdet_q[30:0], rdet_ge};
                         rdet_rem      <= rdet_next;
-                        // Saturate the reciprocal at 2^31-1 (fits the signed DSP
-                        // operand).  rdet_q[31] catches a 1 about to shift OUT of
-                        // the 32-bit register; q_next[31] catches the final
-                        // value's MSB (set on the last beat, which would never
-                        // shift out) — both mean the rounded reciprocal needs
-                        // >=2^31. Small subpixel triangles use Q31 to avoid this cap.
-                        if (rdet_q[31] || q_next[31])
-                            rdet_ovf <= 1'b1;
-                        rdet_q        <= q_next;
-                        rdet_dividend <= {rdet_dividend[43:0], 1'b0};
+                        rdet_dq       <= rdet_dq_next;
                         if (rdet_cnt == 6'd1) begin
+                            // All dividend bits are consumed now. The upper
+                            // quotient bits detect >=2^31 without a running
+                            // overflow flag accidentally inspecting dividend bits.
+                            rdet_ovf <= |rdet_dq_next[44:31];
                             dstate  <= DRV_DA_SEL;  // capture attr-0 operands
                             dv_attr <= 4'd0;        // attr 0 = szi
                             dv_doing_dv <= 1'b0;
@@ -7853,31 +8132,47 @@ always @(posedge clk) begin : main_fsm
                     // narrow.  Launch num_hi*rdet in the same cycle, reusing the
                     // 1-launch/1-wait/1-capture DSP cadence; the low SPLIT bits
                     // feed the lo pass next.  Operands are the captured products.
-                    reg signed [63:0] num_now;
+                    reg signed [49:0] product_delta;
+                    reg signed [53:0] num_now;
+                    product_delta = $signed(drv_prod_r[48:0]) - drv2_prod_r;
                     // num_du always x16 (corrects det's Q12.4 x scale).  num_dv
                     // gets x16 too ONLY for subpix: Q12.4 y scales det an extra
                     // 16x, so dv would otherwise be 16x too small.
                     num_now = (!dv_doing_dv)
-                            ? (($signed(drv_prod_r) - $signed(drv2_prod_r)) <<< 4)
+                            ? $signed({product_delta, 4'b0})
                             : (spanprod_subpix_y
-                                ? (($signed(drv_prod_r) - $signed(drv2_prod_r)) <<< 4)
-                                :  ($signed(drv_prod_r) - $signed(drv2_prod_r)));
+                                ? $signed({product_delta, 4'b0})
+                                : product_delta);
                     dv_num_lo <= num_now[DERIV_SPLIT-1:0];   // low bits for lo pass
                     // num_hi = num_now >>> SPLIT (<=30-bit signed); deriv_sat32
                     // is the deterministic sliver clamp.
                     dsp_a  <= deriv_sat32(num_now >>> DERIV_SPLIT);
                     dsp_b  <= rdet_operand;
+`ifdef INCLUDE_DERIVE_PARALLEL_SCALE
+                    // Numerator products have already been captured. Port 2
+                    // is free to compute the unsigned low reciprocal product
+                    // alongside port 1's signed high product.
+                    dsp2_a <= {{(32-DERIV_SPLIT){1'b0}}, num_now[DERIV_SPLIT-1:0]};
+                    dsp2_b <= rdet_operand;
+`endif
                     dstate <= DRV_SCALE_HW;
                 end
                 DRV_SCALE_HW: dstate <= DRV_SCALE_HC;   // hi-product DSP latency
                 DRV_SCALE_HC: begin
-                    // Capture H = num_hi*rdet (signed, <=63 bits) into the shared
-                    // 64-bit accumulator; launch num_lo*rdet (unsigned).
+                    // Capture H = num_hi*rdet into the shared accumulator.
+                    // The parallel schedule captures L on this same edge;
+                    // otherwise launch L now and capture it after its wait.
                     dv_acc <= dsp_p;
+`ifdef INCLUDE_DERIVE_PARALLEL_SCALE
+                    drv2_prod_r <= dsp2_p;
+                    dstate <= DRV_SCALE_LS;
+`else
                     dsp_a  <= {{(32-DERIV_SPLIT){1'b0}}, dv_num_lo};   // num_lo (unsigned)
                     dsp_b  <= rdet_operand;
                     dstate <= DRV_SCALE_LW;
+`endif
                 end
+`ifndef INCLUDE_DERIVE_PARALLEL_SCALE
                 DRV_SCALE_LW: dstate <= DRV_SCALE_LC;   // lo-product DSP latency
                 DRV_SCALE_LC: begin
                     // timing: lo product (L = num_lo*rdet) captured in drv_prod_r
@@ -7889,6 +8184,7 @@ always @(posedge clk) begin : main_fsm
                     drv_prod_r <= dsp_p;
                     dstate <= DRV_SCALE_LS;
                 end
+`endif
                 DRV_SCALE_LS: begin
                     // Recombine split, stage 1 (timing: 182 of the 200 worst
                     // paths on the third OS30 fit ran drv_prod_r -> 64-bit add
@@ -7900,7 +8196,11 @@ always @(posedge clk) begin : main_fsm
                     // only bit-exact cut.  +1 cycle per du/dv pass (+8 of
                     // ~127 per triangle, still overlapped with the walker).
                     drv_qsum_r <= dv_acc
+`ifdef INCLUDE_DERIVE_PARALLEL_SCALE
+                                + $signed({1'b0, drv2_prod_r[54:DERIV_SPLIT]});
+`else
                                 + $signed({1'b0, drv_prod_r[54:DERIV_SPLIT]});
+`endif
                     // precompute the final shift here so the barrel shift in
                     // DRV_SCALE_LF reads a register, not a mux off vt_q29_shift.
                     // Stored BIASED BY -7: the constant 7 of the total shift is
@@ -7922,16 +8222,37 @@ always @(posedge clk) begin : main_fsm
                 // x >>> (8a+b) == (x >>> 8a) >>> b.  +2 cy/du-dv pass, free under
                 // the walker.  q29_shamt_r precomputed in DRV_SCALE_LS.
                 DRV_SCALE_LF: begin
-                    drv_q_coarse <= (drv_qsum_r >>> 7) >>> {q29_shamt_r[4:3], 3'b000};
-                    dstate <= DRV_SCALE_LF2;
+                    if (EFF_Q29) begin
+                        drv_q_coarse <= (drv_qsum_r >>> 7) >>> {q29_shamt_r[4:3], 3'b000};
+                        dstate <= DRV_SCALE_LF2;
+                    end else begin
+                        // Two fixed scales need one selection, not two shift
+                        // stages. Keep negate/saturation in its separate cycle.
+`ifdef INCLUDE_DERIVE_PARALLEL_SCALE
+                        drv_q_fine <= deriv_clamp_for_sign(rdet_small
+                            ? (drv_qsum_r >>> 7) : (drv_qsum_r >>> 20));
+`else
+                        drv_q_fine <= rdet_small ? (drv_qsum_r >>> 7)
+                                                : (drv_qsum_r >>> 20);
+`endif
+                        dstate <= DRV_SCALE_LF3;
+                    end
                 end
-                DRV_SCALE_LF2: begin
+                DRV_SCALE_LF2: if (EFF_Q29) begin
+`ifdef INCLUDE_DERIVE_PARALLEL_SCALE
+                    drv_q_fine <= deriv_clamp_for_sign(drv_q_coarse >>> q29_shamt_r[2:0]);
+`else
                     drv_q_fine <= drv_q_coarse >>> q29_shamt_r[2:0];
+`endif
                     dstate <= DRV_SCALE_LF3;
                 end
                 DRV_SCALE_LF3: begin : drv_scale_lf3_blk
                     // sign(det) applied, then deriv_sat32 clamps to int32.
+`ifdef INCLUDE_DERIVE_PARALLEL_SCALE
+                    reg signed [32:0] qsigned;
+`else
                     reg signed [63:0] qsigned;
+`endif
                     qsigned = dd_detsign ? -drv_q_fine : drv_q_fine;
                     if (!dv_doing_dv) begin
                         dv_du <= deriv_sat32(qsigned);
@@ -8100,14 +8421,17 @@ always @(posedge clk) begin : main_fsm
         // shared operand regs (dsp_a/dsp_b); dsp2 runs stale operands, unread here.
         // ============================================================
         S_XFORM: begin
-            if ((INCLUDE_GPU_XFORM_MAC != 0) || (INCLUDE_XFORM_RGB != 0) || (INCLUDE_CLIP_TRI != 0)) begin
+            if (!GEOMETRY_WORKER && ((INCLUDE_GPU_XFORM_MAC != 0) || (INCLUDE_XFORM_RGB != 0) || (INCLUDE_CLIP_TRI != 0))) begin
             case (xf_state)
                 // ---- cam[row] = ((M[row][0..2]*v) >>> 16) + M[row][3] ----
                 // xf_M is M10K: XF_MAC_A issues the read (xf_rd_addr=row*4+idx),
                 // xf_M_q is valid in XF_MAC_L.  idx 0-2 = products, idx 3 = the
                 // translate column (captured into xf_transl, no multiply).
-                XF_MAC_A: xf_state <= XF_MAC_L;
-                XF_MAC_L: begin
+                // Gate these states as well as command decode: clip-fed cache
+                // loads keep S_XFORM alive in MAC-less builds. Projection still
+                // uses xf_transl as its ratio pipeline register below.
+                XF_MAC_A: if (INCLUDE_GPU_XFORM_MAC != 0) xf_state <= XF_MAC_L;
+                XF_MAC_L: if (INCLUDE_GPU_XFORM_MAC != 0) begin
                     if (xf_idx == 2'd3) begin
                         xf_transl <= xf_M_q;             // M[row][3]
                         xf_state  <= XF_ROW_DONE;
@@ -8119,13 +8443,13 @@ always @(posedge clk) begin : main_fsm
                         xf_state <= XF_MAC_W;
                     end
                 end
-                XF_MAC_W: xf_state <= XF_MAC_C;   // DSP latency
-                XF_MAC_C: begin
+                XF_MAC_W: if (INCLUDE_GPU_XFORM_MAC != 0) xf_state <= XF_MAC_C;   // DSP latency
+                XF_MAC_C: if (INCLUDE_GPU_XFORM_MAC != 0) begin
                     xf_acc <= (xf_idx == 2'd0) ? dsp_p : (xf_acc + dsp_p);
                     xf_idx <= xf_idx + 2'd1;             // -> next product, or idx 3 = translate
                     xf_state <= XF_MAC_A;               // issue the next M10K read
                 end
-                XF_ROW_DONE: begin : xf_row_done_blk
+                XF_ROW_DONE: if (INCLUDE_GPU_XFORM_MAC != 0) begin : xf_row_done_blk
                     reg signed [31:0] camv;
                     camv = (xf_acc >>> 16) + xf_transl;   // captured M[row][3]
                     case (xf_row)
@@ -8147,7 +8471,7 @@ always @(posedge clk) begin : main_fsm
 `ifdef INCLUDE_XFORM_VERTEX_RAM
                 XF_CLIP_ADDR: xf_state <= XF_CLIP_FEED;
 `endif
-                XF_CLIP_FEED: begin
+                XF_CLIP_FEED: if (!SINGLE_CLIP_VERTEX) begin
                     xf_camx  <= xf_vx_q;
                     xf_camy  <= xf_vy_q;
                     xf_camz  <= xf_vz_q;
@@ -8160,19 +8484,18 @@ always @(posedge clk) begin : main_fsm
                 // (derive-mode only; DRV_RDET re-initializes it before use).
                 XF_RECIP_INIT: begin
                     rdet_rem      <= 35'd0;
-                    rdet_dividend <= {1'b1, 44'd0};   // 2^32 << 12: MSB at the shared bit-44 tap
-                    rdet_q        <= 32'd0;
+                    rdet_dq       <= {1'b1, 44'd0};   // 2^32 << 12: MSB at the shared bit-44 tap
                     rdet_divisor  <= {3'b000, xf_recip_divisor};
-                    rdet_cnt      <= 6'd33;
+                    rdet_cnt      <= (SM64_GEOMETRY && !xf_clip) ? 6'd39 : 6'd33;
                     // T2: tally verts behind the near plane (same compare as the
                     // divisor floor).  All three behind => trivial-reject at LAUNCH.
-                    if (xf_camz < xf_nearclip) xf_behind <= xf_behind + 2'd1;
+                    if (!SINGLE_CLIP_VERTEX && xf_camz < xf_nearclip)
+                        xf_behind <= xf_behind + 2'd1;
                     xf_state        <= XF_RECIP_RUN;
                 end
                 XF_RECIP_RUN: begin
                     rdet_rem      <= rdet_next;
-                    rdet_q        <= {rdet_q[30:0], rdet_ge};
-                    rdet_dividend <= {rdet_dividend[43:0], 1'b0};
+                    rdet_dq       <= rdet_dq_next;
                     if (rdet_cnt == 6'd1) xf_state <= XF_PROJ_XA;
                     else rdet_cnt <= rdet_cnt - 6'd1;
                 end
@@ -8260,11 +8583,11 @@ always @(posedge clk) begin : main_fsm
                     // absolute scale is irrelevant, only frame-consistent ordering.
                     // Harmless for 0x51 (sp_rgb=0 never derives attr6/vt_depth).
                     case (xf_vtx)
-                        2'd0:    begin xf_sy[0] <= xf_sproj_sat; vt_zi[0] <= xf_div_q; vt_depth[0] <= xf_div_q; end
+                        2'd0:    begin xf_sy[0] <= xf_sproj_sat; vt_zi[0] <= xf_div_q; vt_depth[0] <= (SM64_GEOMETRY && !xf_clip) ? rdet_q : xf_div_q; end
                         2'd1:    begin xf_sy[1] <= xf_sproj_sat; vt_zi[1] <= xf_div_q; vt_depth[1] <= xf_div_q; end
                         default: begin xf_sy[2] <= xf_sproj_sat; vt_zi[2] <= xf_div_q; vt_depth[2] <= xf_div_q; end
                     endcase
-                    if (xf_vtx == xf_last_vtx) begin
+                    if (SINGLE_CLIP_VERTEX || SM64_GEOMETRY || xf_vtx == xf_last_vtx) begin
                         // last vert projected -> the parallel-load + derive
                         // launch happens in XF_PROJ_LAUNCH (one cycle later) so
                         // the tri_v* writes are plain register copies, not this
@@ -8290,7 +8613,7 @@ always @(posedge clk) begin : main_fsm
                     // behind near, the projected tri is degenerate/garbage, so
                     // drop it instead of launching the derive.  Straddlers (1-2
                     // behind) fall through and are clipped on the CPU (hybrid).
-                    if (xf_to_cache) begin
+                    if (SINGLE_CLIP_VERTEX || SM64_GEOMETRY || xf_to_cache) begin
                         // T3 0x53/0x57: pack the transformed (+ lit) vert into the
                         // cache slot.  vt_zi[0]/vt_depth[0] set in XF_PROJ_YS2; raw
                         // s/t in dv_szi/dv_tzi[0]; RGB in vt_rrow/lrow/brow[0].
@@ -8303,6 +8626,12 @@ always @(posedge clk) begin : main_fsm
                                                   dv_tzi[0], dv_szi[0],
                                                   vt_zi[0], xf_sy[0], xf_sx[0] };
                         state <= S_IDLE;
+                        if (SM64_GEOMETRY && cmd_class == CMDCLS_GEOMETRY && pay_remaining != 0) begin
+                            pay_idx <= 6'd0;
+                            ring_rdptr <= ring_rdptr + 1'b1;
+                            ring_rd_addr <= ring_rdptr + 1'b1;
+                            state <= S_PAY_DATA;
+                        end
                     end else if (xf_behind == 2'd3) begin
                         state <= S_IDLE;
                     end else begin
@@ -8443,7 +8772,7 @@ always @(posedge clk) begin : main_fsm
                     spanprod_q29_attr_shift <= 5'd0;
                     vt_q29_en    <= 1'b0;
                     vt_q29_shift <= 5'd0;
-                    tri_start    <= 1'b1;
+                    tri_start    <= !(SM64_GEOMETRY && geometry_cull != 0);
                     tri_fill_idx <= 3'd0;
                     dstate <= DRV_SORT_A;
                     state  <= S_TRI_DERIVE;
@@ -8633,6 +8962,12 @@ always @(posedge clk) begin : main_fsm
 
         S_SPANPROD_EMIT: begin
             spanprod_load_generated_span;
+`ifdef INCLUDE_Z_PREFETCH
+            // P3 is empty here. Reuse its address register for the first
+            // depth lookup, sharing the existing read-address/tag muxes.
+            // The arriving real fragment overwrites it normally.
+            p3_z_addr <= spanprod_z_addr_r;
+`endif
             state <= S_FRAG_PIPE;
         end
 
@@ -8870,7 +9205,13 @@ always @(posedge clk) begin : main_fsm
                 p3_discard   <= p2b_discard || (p2b_zf_fold && !p2b_zf_pass);
                 p3_z_test    <= p2b_z_test && !p2b_zf_fold;
                 p3_z_write   <= p2b_z_write && !p2b_zf_fold;
+`ifdef INCLUDE_Z_PREFETCH
+                // Keep the span-start lookup address through empty pipeline
+                // shifts; only an arriving fragment replaces that address.
+                if (p2b_valid) p3_z_addr <= p2b_z_addr;
+`else
                 p3_z_addr    <= p2b_z_addr;
+`endif
                 p3_z_value   <= p2b_z_value;
                 // Blend fold stage 2: the weighted sums register alongside
                 // the pixel (pure reg-to-reg multiplies off p2b_color /
@@ -8932,6 +9273,11 @@ always @(posedge clk) begin : main_fsm
                 p2b_z_write <= p2_z_write;
                 p2b_z_addr  <= p2_z_addr;
                 p2b_z_value <= p2_z_value;
+`ifdef INCLUDE_Z_WINDOW_PREDECODE
+`ifdef INCLUDE_Z_COMPARE_PARALLEL
+                p2b_zw_half_select <= {{(2*ZW_WORDS-1){1'b0}}, 1'b1} << p2_z_addr[ZW_LOW-1:1];
+`endif
+`endif
                 // Blend fold stage 1: registered dst probe (mux-only cone).
                 p2b_cb_dst   <= cbw_p2_dst_w;
                 p2b_cb_hit   <= cbw_p2_hit_w;
@@ -9238,6 +9584,15 @@ always @(posedge clk) begin : main_fsm
             // its R-wait state; the handshake completes here.  AXI orders
             // R strictly after AR acceptance, so the R-wait capture logic
             // can never fire early.
+            // Restart on the requested depth word while the remaining beats
+            // fill in the background. Keep M0 until the entire burst drains.
+            if (zw_fill_busy && blend_rvalid) begin
+                zw_word[zw_fill_beat] <= blend_rdata;
+                zw_valid[zw_fill_beat] <= !zw_fill_killed[zw_fill_beat];
+                zw_fill_beat <= zw_fill_beat + 1'b1;
+                if (zw_fill_beat == ZW_WORDS-1)
+                    zw_fill_active <= 1'b0;
+            end
             if (blend_arvalid && blend_arready)
                 blend_arvalid <= 1'b0;
             case (fbss)
@@ -9327,7 +9682,7 @@ always @(posedge clk) begin : main_fsm
                             ztest_cap_from_read = 1'b1;
                             ztest_cap_word = zw_word[p3_z_word_addr[ZW_LOW-1:2]];
                             fbss               <= FBSS_ZTEST_ACC_EVAL;
-                        end else if (!tex_axi_arvalid && !tex_m0_in_flight
+                        end else if (!zw_fill_busy && !tex_axi_arvalid && !tex_m0_in_flight
                                   && fb_read_barrier_clear) begin
                             // Z-window fill: burst read of the whole aligned
                             // depth line.  The drain barrier is the
@@ -9347,6 +9702,8 @@ always @(posedge clk) begin : main_fsm
                             zw_base       <= p3_z_word_addr[GPU_ADDR_W-1:ZW_LOW];
                             zw_valid      <= 4'b0;
                             zw_fill_beat  <= 2'd0;
+                            zw_fill_active <= ZW_EARLY_RESTART;
+                            zw_fill_killed <= 0;
                             fbss          <= FBSS_ZTEST_R_WAIT;
                         end
                     end
@@ -9364,12 +9721,13 @@ always @(posedge clk) begin : main_fsm
                             fbss <= FBSS_CB_REQ;
                         end else if (sp_truecolor && sp_blend && p3_cb_stale) begin
                             // Stale capture: a same-half commit landed at one
-                            // of this pixel's capture edges.  Detour one
-                            // cycle to re-derive the sums from fb_acc (which
-                            // now holds the half) — a state, not an inline
-                            // cycle, so the multiplier operand select stays a
-                            // registered state compare.
-                            fbss <= FBSS_CB_REFRESH;
+                            // of this pixel's capture edges.  Its predecessor
+                            // is already in fb_acc, and this arm neither
+                            // commits nor flushes it.  Capture the half now,
+                            // then spend the existing one-cycle detour on
+                            // RESOLVE with registered multiplier operands.
+                            cb_dst_r <= cb_acc_dst_w;
+                            fbss <= FBSS_CB_RESOLVE;
                         end else begin
                         p3_word_match = fb_acc_p3_word_match;
 
@@ -9430,37 +9788,32 @@ always @(posedge clk) begin : main_fsm
                 end
 
 	                FBSS_ZTEST_R_WAIT: begin
-			                    if (blend_rvalid) begin
-		                        // Collect all 4 beats of the z-line burst into
-		                        // the window; the beat that carries the word
-		                        // under test feeds ACC_EVAL exactly as the old
-		                        // single-word read did.
-		                        //
-		                        // PRUNE GATE: with GPU_Z_READ_WINDOW==1 the fill
-		                        // is a single beat (arlen 0) carrying exactly the
-		                        // word under test, so both per-beat conditions
-		                        // fold to constant-true, the zw_* bookkeeping
-		                        // goes write-only (unread -> swept), and zw_valid
-		                        // stays constant 0.
-		                        zw_word[zw_fill_beat] <= blend_rdata;
-		                        zw_fill_beat          <= zw_fill_beat + 1'b1;
-		                        if ((GPU_Z_READ_WINDOW <= 1)
-		                          || (zw_fill_beat == p3_z_word_addr[ZW_LOW-1:2])) begin
-		                            // Shared ztest capture (source: read return).
-		                            ztest_cap_fire = 1'b1;
-		                            ztest_cap_from_read = 1'b1;
-		                            ztest_cap_word = blend_rdata;
-		                        end
-		                        if ((GPU_Z_READ_WINDOW <= 1)
-		                          || (zw_fill_beat == (ZW_WORDS-1))) begin
-		                            zw_valid <= (GPU_Z_READ_WINDOW > 1) ? {ZW_WORDS{1'b1}}
-		                                                                : 4'h0;
-		                            fbss     <= FBSS_ZTEST_ACC_EVAL;
-		                        end
-		                    end
-		                end
+                    if (blend_rvalid) begin
+                        // The legacy path fills the entire window before
+                        // evaluation. Early restart's background collector
+                        // handles the burst and this state waits only for
+                        // the word needed by the parked p3 pixel.
+                        if (!ZW_EARLY_RESTART) begin
+                            zw_word[zw_fill_beat] <= blend_rdata;
+                            zw_fill_beat <= zw_fill_beat + 1'b1;
+                        end
+                        if ((GPU_Z_READ_WINDOW <= 1)
+                            || (zw_fill_beat == p3_z_word_addr[ZW_LOW-1:2])) begin
+                            ztest_cap_fire = 1'b1;
+                            ztest_cap_from_read = 1'b1;
+                            ztest_cap_word = blend_rdata;
+                            if (ZW_EARLY_RESTART) fbss <= FBSS_ZTEST_ACC_EVAL;
+                        end
+                        if (!ZW_EARLY_RESTART && ((GPU_Z_READ_WINDOW <= 1)
+                            || (zw_fill_beat == (ZW_WORDS-1)))) begin
+                            zw_valid <= (GPU_Z_READ_WINDOW > 1) ? {ZW_WORDS{1'b1}}
+                                                                : 4'h0;
+                            fbss <= FBSS_ZTEST_ACC_EVAL;
+                        end
+                    end
+                end
 
-		                FBSS_ZTEST_ACC_EVAL: begin
+                FBSS_ZTEST_ACC_EVAL: begin
 		                    // The pixel's own operands (value/half-select/
 		                    // write/word address) are read from the LIVE p3
 		                    // registers: p3 is held valid and unshifted for
@@ -9527,7 +9880,7 @@ always @(posedge clk) begin : main_fsm
                         end else begin
                             fbss <= FBSS_FLUSH_W_RSP;   // queue full: drain, retry
                         end
-                    end else if (!tex_axi_arvalid && !tex_m0_in_flight
+                    end else if (!zw_fill_busy && !tex_axi_arvalid && !tex_m0_in_flight
                               && fb_read_barrier_clear) begin
                         // All writes drained: fill the dst window with one
                         // aligned burst (the requested word feeds this pixel;
@@ -9573,29 +9926,11 @@ always @(posedge clk) begin : main_fsm
                     cb_sg       <= cbm_sum_g_w;
                     cb_sb       <= cbm_sum_b_w;
                     p3_cb_ready <= 1'b1;
-                    // cb_dst_r is fresh post-drain SDRAM content — fresher
-                    // than any staleness the capture edges flagged (and the
-                    // refresh would read the acc CB_REQ just flushed).
+                    // cb_dst_r includes all earlier commits, either from the
+                    // miss path after its barrier or from IDLE's accumulator
+                    // capture.  Both paths resolve the stale-probe flag.
                     p3_cb_stale <= 1'b0;
                     fbss        <= FBSS_IDLE;
-                end
-                FBSS_CB_REFRESH: begin
-`ifdef INCLUDE_CB_REFRESH_PIPE
-                    // The pipe remains frozen through RESOLVE.  Reuse its
-                    // destination register so lane selection and weighted
-                    // sums occupy separate cycles on same-half overdraw.
-                    cb_dst_r <= cb_acc_dst_w;
-                    fbss <= FBSS_CB_RESOLVE;
-`else
-                    // One cycle: re-derive the stale pixel's sums from the
-                    // fb_acc-resident dst half through the shared
-                    // multipliers, then commit normally from IDLE.
-                    cb_sr       <= cbm_sum_r_w;
-                    cb_sg       <= cbm_sum_g_w;
-                    cb_sb       <= cbm_sum_b_w;
-                    p3_cb_stale <= 1'b0;
-                    fbss        <= FBSS_IDLE;
-`endif
                 end
 
 	                // --------------------------------------------------------
@@ -9625,7 +9960,7 @@ always @(posedge clk) begin : main_fsm
                     //      gates catch the ones that have.
                     if (!blend_group_active) begin
                         fbss <= FBSS_IDLE;
-                    end else if (!tex_axi_arvalid && !tex_m0_in_flight
+                    end else if (!zw_fill_busy && !tex_axi_arvalid && !tex_m0_in_flight
                               && fb_read_barrier_clear) begin
                         blend_arvalid <= 1;
                         blend_araddr  <= blend_group_word_addr;
@@ -9729,6 +10064,33 @@ always @(posedge clk) begin : main_fsm
 
                 default: fbss <= FBSS_IDLE;
             endcase
+
+`ifdef INCLUDE_Z_PREFETCH
+            // Fetch the next span's first depth line while perspective/source
+            // setup warms up. An empty texture queue AND pixel pipeline mean
+            // no older fragment can lose its window. The normal collector
+            // retains M0 until the last beat; pixel preparation runs meanwhile.
+            // Accumulator forwarding, full write drain and per-word snoops
+            // preserve depth order, including writes during an active fill.
+            if (ZW_EARLY_RESTART && fbss == FBSS_IDLE
+                && zw_prefetch_armed && !p0a_valid
+                && sp_z_test_enable && sp_count != 0 && !src_done
+                && !(z_acc_valid && z_acc_addr[GPU_ADDR_W-1:2] == p3_z_addr[GPU_ADDR_W-1:2])
+                && !(zw_base == p3_z_addr[GPU_ADDR_W-1:ZW_LOW]
+                     && zw_valid[p3_z_addr[ZW_LOW-1:2]])
+                && !zw_fill_busy && !zw_snoop_pending
+                && !tex_axi_arvalid && !tex_m0_in_flight
+                && !dma_owns_ar && fb_write_drain_complete) begin
+                blend_arvalid <= 1'b1;
+                blend_araddr <= {p3_z_addr[GPU_ADDR_W-1:ZW_LOW], {ZW_LOW{1'b0}}};
+                blend_arlen_r <= ZW_WORDS-1;
+                zw_base <= p3_z_addr[GPU_ADDR_W-1:ZW_LOW];
+                zw_valid <= 0;
+                zw_fill_beat <= 0;
+                zw_fill_active <= 1'b1;
+                zw_fill_killed <= 0;
+            end
+`endif
 
             // ----------------------------------------------------------
             // During IDLE, capture the candidate depth independently of
@@ -10419,7 +10781,7 @@ always @(posedge clk) begin : main_fsm
             // framebuffer accumulators before accepting the next command.
             // ----------------------------------------------------------
 		            if (src_done && !stream_pending && !p0a_valid && !p0_valid && !p1_valid && !p2_valid && !p2b_valid
-		                         && !p3_valid && fbss == FBSS_IDLE
+		                         && !p3_valid && fbss == FBSS_IDLE && !zw_fill_busy
 		                         && !blend_group_active
 		                         && !persp_active) begin
 	                src_done <= 0;
@@ -10473,7 +10835,7 @@ always @(posedge clk) begin : main_fsm
             else if (sp_fastpath && spanprod_active
                   && (spanprod_idx != spanprod_last_idx)
                   && src_done && !stream_pending && !p0a_valid && !p0_valid
-                  && !blend_group_active && !persp_active) begin
+                  && !blend_group_active && !persp_active && !zw_fill_busy) begin
                 src_done <= 0;
                 spanprod_idx <= spanprod_idx + 2'd1;
                 state <= S_SPANPROD_SELECT;
@@ -10766,8 +11128,14 @@ always @(posedge clk) begin : main_fsm
             zw_snoop_pending <= (GPU_Z_READ_WINDOW > 1)
                               && fbwq_push_req && fbwq_can_push;
             if ((GPU_Z_READ_WINDOW > 1) && zw_snoop_pending
-                && (fbwq_req_addr[GPU_ADDR_W-1:ZW_LOW] == zw_base))
+                && (fbwq_req_addr[GPU_ADDR_W-1:ZW_LOW] == zw_base)) begin
                 zw_valid[fbwq_req_addr[ZW_LOW-1:2]] <= 1'b0;
+                // A write may precede its fill beat. Do not let a later stale
+                // response revalidate it. Normal snoop suppression covers
+                // writes landing on the same edge as a fill beat as well.
+                if (zw_fill_busy)
+                    zw_fill_killed[fbwq_req_addr[ZW_LOW-1:2]] <= 1'b1;
+            end
             // Blend-dst window snoop: identical contract, own pending bit.
             // Sweeps with the window when INCLUDE_DIRECT_COLOR is absent OR
             // the window is 1 word (cbw_valid is never set either way, so

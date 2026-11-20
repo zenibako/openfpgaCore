@@ -70,6 +70,31 @@ hash of its data). A state from another game then fails to load with
 `OF_ERR_DENIED`, distinct from `OF_ERR_IO` for a damaged one, and the app can
 tell the player why: the Pocket itself only says "Load failed".
 
+## Retained Quake2 release
+
+The supported Quake2 I64 release is a frozen, hardware-tested app/core pair,
+separate from the general development source tree:
+
+```bash
+python3 tools/core_release.py verify
+python3 tools/core_release.py export  # new build/releases/os30-quake2/
+python3 tools/core_release.py stage   # new build/releases/os30-quake2-sources/
+```
+
+The [profile instructions](release/os30-quake2/README.txt) include the exact
+sources, binary hashes, licenses and complete 30-seed timing evidence.
+Seed 16 estimates **90.69 MHz**, with the clock configured at 100 MHz; this
+does **not** establish 100 MHz timing closure. The slower I32 cache cut and
+the I64 RAM repack that failed the >90 MHz sweep are excluded.
+
+Use Quake2's approved release targets with this core. Keep SM64's separately
+tested core. Generic `make build`, `make package` and `make sdk` operate on
+the development tree and do not reproduce these specialized release pairs.
+No release-profile command writes to an SD card or publishes a release.
+
+See [os20/os25 qualification](release/OS20-OS25.txt) for the faster os20 divider,
+the retained os25 build, rejected trials and scoped SDK update instructions.
+
 ## Acknowledgments
 
 VexiiRiscv (SpinalHDL, Charles Papon), musl libc, Analogizer and SNAC
