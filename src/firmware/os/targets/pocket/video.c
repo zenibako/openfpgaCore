@@ -47,8 +47,8 @@ static uint32_t vid_frame_bytes = FB_SIZE;
 /* Common presets for app menus/enumeration. of_video_set_mode() accepts any
  * geometry that passes video_normalize_mode(); this table is not exhaustive. */
 static const of_video_mode_t video_modes[] = {
+    {128, 128, 0, COLOR_MODE_8BIT, 0},
     {256, 224, 0, COLOR_MODE_8BIT, 0},
-    {256, 240, 0, COLOR_MODE_8BIT, 0},
     {320, 200, 0, COLOR_MODE_8BIT, 0},
     {320, 224, 0, COLOR_MODE_8BIT, 0},
     {320, 240, 0, COLOR_MODE_8BIT, 0},
@@ -75,7 +75,7 @@ static const video_scaler_mode_t scaler_modes[] = {
     {320, 256, 3},
     {320, 288, 4},
     {400, 300, 5},
-    {256, 240, 6},
+    {128, 128, 6},   /* 1:1; PICO-8-sized, LCD integer-scales to 11x (was 256x240) */
     {640, 480, 7},   /* 4:3; full-res slot 7 (core_top.v scaler_slot_*(7)) */
 };
 

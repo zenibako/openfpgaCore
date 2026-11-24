@@ -2443,7 +2443,7 @@ assign video_hs = vidout_hs;
                 3'd3: scaler_slot_width = 10'd320;
                 3'd4: scaler_slot_width = 10'd320;
                 3'd5: scaler_slot_width = 10'd400;
-                3'd6: scaler_slot_width = 10'd256;
+                3'd6: scaler_slot_width = 10'd128;   /* 128x128 1:1 (PICO-8 11x on the LCD) */
                 3'd7: scaler_slot_width = 10'd640;   /* 640x480 (full-res) */
                 default: scaler_slot_width = 10'd320;
             endcase
@@ -2460,7 +2460,7 @@ assign video_hs = vidout_hs;
                 3'd3: scaler_slot_height = 10'd256;
                 3'd4: scaler_slot_height = 10'd288;
                 3'd5: scaler_slot_height = 10'd300;
-                3'd6: scaler_slot_height = 10'd240;
+                3'd6: scaler_slot_height = 10'd128;   /* 128x128; centred in the 240-line window like 200/224 */
                 3'd7: scaler_slot_height = 10'd480;   /* 640x480 (full-res); V_TOTAL floors to 18+480=498 -> ~31.6 Hz at the 12.288 MHz video clock */
                 default: scaler_slot_height = 10'd240;
             endcase

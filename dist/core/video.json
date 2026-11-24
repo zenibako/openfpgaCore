@@ -51,10 +51,10 @@
                 "mirror": 0
             },
             {
-                "width": 256,
-                "height": 240,
-                "aspect_w": 4,
-                "aspect_h": 3,
+                "width": 128,
+                "height": 128,
+                "aspect_w": 1,
+                "aspect_h": 1,
                 "rotation": 0,
                 "mirror": 0
             },
