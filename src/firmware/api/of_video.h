@@ -338,9 +338,13 @@ static inline int of_video_check_mode(const of_video_mode_t *mode,
  * instead of falling back to slot 0.  slots[i] describes slot i; pass the same
  * sizes, in the same order, as the scaler_modes in the app's video.json.
  * Slot 0 must be 320x240 and slot 7 640x480 (boot/terminal and Analogizer
- * use them); entries past `count` keep the default table.  Sizes are
- * 16..640 wide and 16..600 tall.  Call once at startup, before
- * of_video_set_mode().
+ * use them).  Each call describes the whole table: entries past `count` go
+ * back to the default table, not to an earlier call's values.  Sizes are
+ * 16..640 wide and 16..600 tall.  A framebuffer uses a slot only when its
+ * size matches that slot exactly.
+ *
+ * Call once at startup, before of_video_set_mode().  The hardware applies a
+ * new slot or size at the next frame boundary, never mid-frame.
  *
  * Returns 0 on success, -1 when the runtime or bitstream has a fixed slot
  * table (keep the app's fallback path), -2 for an invalid table. */

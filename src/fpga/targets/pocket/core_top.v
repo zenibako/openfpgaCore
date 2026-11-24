@@ -2458,17 +2458,11 @@ assign video_hs = vidout_hs;
     reg [9:0]  vrr_vt_hold;         // stable copy latched in clk_cpu
     reg [2:0]  vrr_toggle_sync;     // 3-stage synchronizer in clk_vid
     reg [9:0]  vrr_vt_sync2;        // output in clk_vid domain
-    // Selected scaler slot + its raster geometry, carried clk_cpu -> clk_vid
-    // as one 23-bit word with the same toggle handshake as vrr_v_total, so
-    // the slot number and its size always change together.
-    reg [22:0] scaler_sel_hold;
-    reg        scaler_sel_toggle_cpu;
-    reg [2:0]  scaler_sel_toggle_sync;
-    reg [2:0]  video_scaler_slot_vid;
-    reg [9:0]  video_scaler_width_vid;
-    reg [9:0]  video_scaler_height_vid;
-    wire [22:0] scaler_sel_cpu =
-        {video_scaler_slot_cpu, video_scaler_width_cpu, video_scaler_height_cpu};
+    // Selected scaler slot + its raster geometry in clk_vid, applied at the
+    // frame boundary (scaler_geom_cdc: acknowledged two-phase handshake).
+    wire [2:0]  video_scaler_slot_vid;
+    wire [9:0]  video_scaler_width_vid;
+    wire [9:0]  video_scaler_height_vid;
 
     always @(posedge clk_cpu or negedge reset_n_cpu_core) begin
         if (~reset_n_cpu_core) begin
@@ -2480,32 +2474,28 @@ assign video_hs = vidout_hs;
         end
     end
 
-    always @(posedge clk_cpu or negedge reset_n_cpu_core) begin
-        if (~reset_n_cpu_core) begin
-            scaler_sel_toggle_cpu <= 1'b0;
-            scaler_sel_hold <= {3'd0, 10'd320, 10'd240};
-        end else if (scaler_sel_hold != scaler_sel_cpu) begin
-            scaler_sel_hold <= scaler_sel_cpu;
-            scaler_sel_toggle_cpu <= ~scaler_sel_toggle_cpu;
-        end
-    end
+    scaler_geom_cdc scaler_geom (
+        .clk_cpu(clk_cpu),
+        .reset_cpu_n(reset_n_cpu_core),
+        .slot_cpu(video_scaler_slot_cpu),
+        .width_cpu(video_scaler_width_cpu),
+        .height_cpu(video_scaler_height_cpu),
+        .clk_vid(clk_vid),
+        .reset_vid_n(reset_n_vid),
+        .frame_start_vid(x_count == 10'd0 && y_count == 10'd0),
+        .slot_vid(video_scaler_slot_vid),
+        .width_vid(video_scaler_width_vid),
+        .height_vid(video_scaler_height_vid)
+    );
 
     always @(posedge clk_vid or negedge reset_n_vid) begin
         if (~reset_n_vid) begin
             vrr_toggle_sync <= 3'b0;
             vrr_vt_sync2 <= CRT_V_TOTAL_DEFAULT;
-            scaler_sel_toggle_sync <= 3'b0;
-            video_scaler_slot_vid <= 3'd0;
-            video_scaler_width_vid <= 10'd320;
-            video_scaler_height_vid <= 10'd240;
         end else begin
             vrr_toggle_sync <= {vrr_toggle_sync[1:0], vrr_toggle_cpu};
             if (vrr_toggle_sync[2] != vrr_toggle_sync[1])
                 vrr_vt_sync2 <= vrr_vt_hold;  // stable — toggle edge means new value ready
-            scaler_sel_toggle_sync <= {scaler_sel_toggle_sync[1:0], scaler_sel_toggle_cpu};
-            if (scaler_sel_toggle_sync[2] != scaler_sel_toggle_sync[1])
-                {video_scaler_slot_vid, video_scaler_width_vid, video_scaler_height_vid}
-                    <= scaler_sel_hold;  // stable: the toggle edge means a new value
         end
     end
 

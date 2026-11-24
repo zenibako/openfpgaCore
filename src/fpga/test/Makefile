@@ -230,6 +230,12 @@ SKID_CPP  = tb_skid_buffer_main.cpp
 SKID_TOP  = skid_buffer
 SKID_DIR  = obj_dir_skid
 
+# Pocket scaler slot geometry CDC + raster (runtime slot switching)
+SCALER_GEOM_SRCS = $(COMMON_DIR)/scaler_geom_cdc.v tb_scaler_geom.v
+SCALER_GEOM_CPP  = tb_scaler_geom_main.cpp
+SCALER_GEOM_TOP  = tb_scaler_geom
+SCALER_GEOM_DIR  = obj_dir_scaler_geom
+
 # MiSTer direct-framebuffer pipeline (SDRAM->DDR3 frame DMA + burst arbiter)
 DDR3FB_SRCS = tb_ddr3_fb.v ../targets/mister/ddr3_fb.sv
 DDR3FB_CPP  = tb_ddr3_fb_main.cpp
@@ -636,7 +642,7 @@ SYSTEM_FLAGS = -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-CASEINCOMPLETE \
 # Targets
 # ============================================================
 .PHONY: all sdram sdram-serialize sdram-native2 sdram-wcont0 sdram-all sdram-cont sram scanout scanout-lean analogchain gpu gpu-persp gpu-floor gpu-gpudemo gpu-acceptance gpu-acceptance-single gpu-acceptance-os30 gpu-acceptance-zraw gpu-acceptance-burst2 gpu-acceptance-all gpu-acceptance-nomac gpu-elab-nomac-noclip gpu-chain \
-        gpu-wrpath gpu-wstall scanout-race scanout-race-pocket axi-periph bridge-cmd savestate bridge-rx audio audio-mixer arbiter system system-mister run run-sram build clean \
+        gpu-wrpath gpu-wstall scanout-race scanout-race-pocket axi-periph scaler-geom bridge-cmd savestate bridge-rx audio audio-mixer arbiter system system-mister run run-sram build clean \
         cram1-tex-chain cram1-cmap-chain gpu-cram1-repro
 
 all: sdram-all sram gpu gpu-persp axi-periph bridge-cmd savestate bridge-rx audio audio-mixer arbiter hps-bridge hps-mouse hps-keyboard skid ddr3-fb
@@ -1547,6 +1553,16 @@ $(MIXER_MISTER_DIR)/V$(MIXER_TOP): $(MIXER_SRCS) $(MIXER_CPP)
 skid: $(SKID_DIR)/V$(SKID_TOP)
 	@printf "\n=== AXI skid buffer (register slice) ===\n"
 	./$(SKID_DIR)/V$(SKID_TOP)
+
+# --- Pocket scaler slot geometry: CDC handshake + frame-boundary apply ---
+scaler-geom: $(SCALER_GEOM_DIR)/V$(SCALER_GEOM_TOP)
+	@printf "\n=== Pocket scaler slot geometry (CDC + raster) ===\n"
+	./$(SCALER_GEOM_DIR)/V$(SCALER_GEOM_TOP)
+
+$(SCALER_GEOM_DIR)/V$(SCALER_GEOM_TOP): $(SCALER_GEOM_SRCS) $(SCALER_GEOM_CPP)
+	$(VERILATOR) $(VERILATOR_FLAGS_NOTRACE) -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC \
+		--top-module $(SCALER_GEOM_TOP) --Mdir $(SCALER_GEOM_DIR) \
+		$(SCALER_GEOM_SRCS) $(SCALER_GEOM_CPP)
 
 # --- MiSTer direct-framebuffer pipeline (ddr3_fb + video_burst_arb) ---
 ddr3-fb: $(DDR3FB_DIR)/V$(DDR3FB_TOP)

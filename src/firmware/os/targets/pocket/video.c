@@ -110,6 +110,10 @@ static void video_program_scaler_table(void) {
                                                  scaler_modes[i].height);
 }
 
+/* A framebuffer only maps to a slot of exactly its size (otherwise slot 0,
+ * at most 600/240 = 2.5:1).  The scanout's vertical step saturates at 3:1,
+ * so this exact-match rule is what keeps app-defined slots (down to 16 lines)
+ * from cropping: the scaler never sees a source taller than 3x its slot. */
 static const video_scaler_mode_t *video_scaler_mode_for_size(uint16_t width,
                                                              uint16_t height) {
     for (unsigned i = 0; i < sizeof(scaler_modes) / sizeof(scaler_modes[0]); i++) {
@@ -1039,9 +1043,14 @@ int of_video_set_scaler_slots(const of_video_scaler_slot_t *slots,
             return -2;
     }
 
-    for (uint32_t i = 1; i < count && i + 1 < SCALER_SLOT_COUNT; i++) {
-        scaler_modes[i].width = slots[i].width;
-        scaler_modes[i].height = slots[i].height;
+    /* Each call describes the whole table: slots past `count` go back to the
+     * defaults, so the programmed table never mixes in an earlier call. */
+    for (uint32_t i = 1; i + 1 < SCALER_SLOT_COUNT; i++) {
+        scaler_modes[i] = default_scaler_modes[i];
+        if (i < count) {
+            scaler_modes[i].width = slots[i].width;
+            scaler_modes[i].height = slots[i].height;
+        }
     }
     video_program_scaler_table();
     /* Re-resolve the current mode's slot against the new table. */

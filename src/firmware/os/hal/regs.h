@@ -129,7 +129,10 @@
  * with bit 31 = 1 sets slot [30:28]'s raster to width [27:18] x height [17:8]
  * (slots 0 and 7 are fixed; hardware clamps to 16..640 x 16..600).  Reads
  * return [31] = writable slot table, [29:20] height, [19:10] width of the
- * selected slot, [2:0] slot.  Older bitstreams read [31] = 0. */
+ * selected slot, [2:0] slot.  Older bitstreams read [31] = 0.  The raster
+ * switches to a new slot or size at the next frame start.  The scanout
+ * downscales at most 3:1 vertically, so only select a slot whose height is
+ * at least a third of the framebuffer's (video.c uses exact matches). */
 #define VIDEO_SCALER_MODE   REG32(SYSREG_BASE + 0xEC)
 #define   VIDEO_SCALER_TABLE_WRITABLE  (1u << 31)
 #define   VIDEO_SCALER_PROGRAM(slot, w, h) \
