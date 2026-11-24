@@ -68,7 +68,10 @@ typedef struct {
     uint8_t slot;
 } video_scaler_mode_t;
 
-static const video_scaler_mode_t scaler_modes[] = {
+/* Default slot table (dist/core/video.json).  Apps on bitstreams with a
+ * writable slot table can replace slots 1-6 with of_video_set_scaler_slots();
+ * slot 0 (boot/terminal) and slot 7 (Analogizer RGBHV) are fixed. */
+static const video_scaler_mode_t default_scaler_modes[] = {
     {320, 240, 0},
     {320, 200, 1},
     {320, 224, 2},
@@ -78,6 +81,34 @@ static const video_scaler_mode_t scaler_modes[] = {
     {256, 240, 6},
     {640, 480, 7},   /* 4:3; full-res slot 7 (core_top.v scaler_slot_*(7)) */
 };
+
+static video_scaler_mode_t scaler_modes[] = {
+    {320, 240, 0},
+    {320, 200, 1},
+    {320, 224, 2},
+    {320, 256, 3},
+    {320, 288, 4},
+    {400, 300, 5},
+    {256, 240, 6},
+    {640, 480, 7},
+};
+
+#define SCALER_SLOT_COUNT (sizeof(scaler_modes) / sizeof(scaler_modes[0]))
+#define SCALER_SLOT_MIN 16u
+#define SCALER_SLOT_MAX_WIDTH 640u
+#define SCALER_SLOT_MAX_HEIGHT 600u
+
+static int video_scaler_table_writable(void) {
+    return (VIDEO_SCALER_MODE & VIDEO_SCALER_TABLE_WRITABLE) != 0;
+}
+
+/* Write the RAM table to hardware.  Only slots 1-6; the bitstream ignores
+ * writes to 0 and 7 anyway. */
+static void video_program_scaler_table(void) {
+    for (unsigned i = 1; i + 1 < SCALER_SLOT_COUNT; i++)
+        VIDEO_SCALER_MODE = VIDEO_SCALER_PROGRAM(i, scaler_modes[i].width,
+                                                 scaler_modes[i].height);
+}
 
 static const video_scaler_mode_t *video_scaler_mode_for_size(uint16_t width,
                                                              uint16_t height) {
@@ -987,6 +1018,37 @@ int of_video_check_mode(const of_video_mode_t *mode,
     return video_normalize_mode(mode, normalized, &frame_bytes);
 }
 
+int of_video_set_scaler_slots(const of_video_scaler_slot_t *slots,
+                              uint32_t count) {
+    if (!video_scaler_table_writable())
+        return -1;
+    if (!slots || count == 0 || count > SCALER_SLOT_COUNT)
+        return -2;
+    for (uint32_t i = 0; i < count; i++) {
+        const video_scaler_mode_t *fixed = &default_scaler_modes[i];
+        if (i == 0 || i + 1 == SCALER_SLOT_COUNT) {
+            if (slots[i].width != fixed->width ||
+                slots[i].height != fixed->height)
+                return -2;
+            continue;
+        }
+        if (slots[i].width < SCALER_SLOT_MIN ||
+            slots[i].width > SCALER_SLOT_MAX_WIDTH ||
+            slots[i].height < SCALER_SLOT_MIN ||
+            slots[i].height > SCALER_SLOT_MAX_HEIGHT)
+            return -2;
+    }
+
+    for (uint32_t i = 1; i < count && i + 1 < SCALER_SLOT_COUNT; i++) {
+        scaler_modes[i].width = slots[i].width;
+        scaler_modes[i].height = slots[i].height;
+    }
+    video_program_scaler_table();
+    /* Re-resolve the current mode's slot against the new table. */
+    video_program_visible_mode();
+    return 0;
+}
+
 void of_video_set_color_mode(int mode) {
     of_video_mode_t next = vid_mode;
     uint32_t old_frame_bytes = vid_frame_bytes;
@@ -1055,6 +1117,12 @@ void of_video_init(void) {
 
     (void)video_normalize_mode(&default_mode, &vid_mode, &frame_bytes);
     vid_frame_bytes = frame_bytes;
+    /* A relaunched app starts from the default slot table, not the previous
+     * app's. */
+    for (unsigned i = 0; i < SCALER_SLOT_COUNT; i++)
+        scaler_modes[i] = default_scaler_modes[i];
+    if (video_scaler_table_writable())
+        video_program_scaler_table();
     video_program_app_mode();
 
     /* Switch scanout to app triple-buffered FB */

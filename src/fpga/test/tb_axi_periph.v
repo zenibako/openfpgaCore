@@ -191,6 +191,8 @@ end
 
 // DUT
 axi_periph_slave #(
+    // Raster follows the writable scaler slot table (VIDEO_SCALER_MODE).
+    .SCALER_TABLE_WRITABLE(1),
     .INCLUDE_PERSPECTIVE(INCLUDE_PERSPECTIVE),
     .INCLUDE_DEPTH(INCLUDE_DEPTH),
     .INCLUDE_PARAM_SPAN_LIST(INCLUDE_PARAM_SPAN_LIST),

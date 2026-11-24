@@ -54,6 +54,15 @@ typedef struct of_video_caps {
 } of_video_caps_t;
 #endif
 
+#ifndef OF_VIDEO_SCALER_SLOT_T_DEFINED
+#define OF_VIDEO_SCALER_SLOT_T_DEFINED
+typedef struct of_video_scaler_slot {
+    uint16_t width;
+    uint16_t height;
+} of_video_scaler_slot_t;
+#define OF_VIDEO_SCALER_SLOTS 8
+#endif
+
 /* Initialize framebuffer subsystem (sets display mode, initial palette) */
 void of_video_init(void);
 
@@ -70,6 +79,7 @@ int of_video_get_mode_count(void);
 int of_video_get_mode_info(int index, of_video_mode_t *out);
 void of_video_get_caps(of_video_caps_t *out);
 int of_video_check_mode(const of_video_mode_t *mode, of_video_mode_t *normalized);
+int of_video_set_scaler_slots(const of_video_scaler_slot_t *slots, uint32_t count);
 
 /* Get pointer to current draw buffer (write pixels here) */
 uint8_t *of_video_get_surface(void);

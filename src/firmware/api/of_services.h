@@ -76,6 +76,17 @@ typedef struct of_video_caps {
 } of_video_caps_t;
 #endif
 
+#ifndef OF_VIDEO_SCALER_SLOT_T_DEFINED
+#define OF_VIDEO_SCALER_SLOT_T_DEFINED
+/* One hardware scaler slot: the raster size the core emits for it.  An app's
+ * table must match the scaler_modes in its own core's video.json. */
+typedef struct of_video_scaler_slot {
+    uint16_t width;
+    uint16_t height;
+} of_video_scaler_slot_t;
+#define OF_VIDEO_SCALER_SLOTS 8
+#endif
+
 struct of_services_table {
     uint32_t magic;
     uint32_t version;
@@ -345,6 +356,11 @@ struct of_services_table {
     /* -- Save-state game identity (append-only) --
      * See of_savestate_set_id() in of_savestate.h. */
     int       (*savestate_set_id)(const void *id, uint32_t len);
+
+    /* -- App-defined scaler slots (append-only) --
+     * See of_video_set_scaler_slots() in of_video.h. */
+    int       (*video_set_scaler_slots)(const of_video_scaler_slot_t *slots,
+                                        uint32_t count);
 };
 
 #ifndef OF_PC

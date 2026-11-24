@@ -2383,6 +2383,8 @@ assign video_hs = vidout_hs;
     wire [9:0]  analog_src_fb_height;
     wire [15:0] analog_src_fb_stride;
     wire [2:0] video_scaler_slot_cpu;
+    wire [9:0] video_scaler_width_cpu;
+    wire [9:0] video_scaler_height_cpu;
 
     // VRR: firmware-written V_TOTAL
     wire [9:0] vrr_v_total_cpu;
@@ -2392,8 +2394,17 @@ assign video_hs = vidout_hs;
     reg [9:0]  vrr_vt_hold;         // stable copy latched in clk_cpu
     reg [2:0]  vrr_toggle_sync;     // 3-stage synchronizer in clk_vid
     reg [9:0]  vrr_vt_sync2;        // output in clk_vid domain
-    reg [2:0]  video_scaler_slot_s1;
+    // Selected scaler slot + its raster geometry, carried clk_cpu -> clk_vid
+    // as one 23-bit word with the same toggle handshake as vrr_v_total, so
+    // the slot number and its size always change together.
+    reg [22:0] scaler_sel_hold;
+    reg        scaler_sel_toggle_cpu;
+    reg [2:0]  scaler_sel_toggle_sync;
     reg [2:0]  video_scaler_slot_vid;
+    reg [9:0]  video_scaler_width_vid;
+    reg [9:0]  video_scaler_height_vid;
+    wire [22:0] scaler_sel_cpu =
+        {video_scaler_slot_cpu, video_scaler_width_cpu, video_scaler_height_cpu};
 
     always @(posedge clk_cpu or negedge reset_n_cpu_core) begin
         if (~reset_n_cpu_core) begin
@@ -2405,18 +2416,32 @@ assign video_hs = vidout_hs;
         end
     end
 
+    always @(posedge clk_cpu or negedge reset_n_cpu_core) begin
+        if (~reset_n_cpu_core) begin
+            scaler_sel_toggle_cpu <= 1'b0;
+            scaler_sel_hold <= {3'd0, 10'd320, 10'd240};
+        end else if (scaler_sel_hold != scaler_sel_cpu) begin
+            scaler_sel_hold <= scaler_sel_cpu;
+            scaler_sel_toggle_cpu <= ~scaler_sel_toggle_cpu;
+        end
+    end
+
     always @(posedge clk_vid or negedge reset_n_vid) begin
         if (~reset_n_vid) begin
             vrr_toggle_sync <= 3'b0;
             vrr_vt_sync2 <= CRT_V_TOTAL_DEFAULT;
-            video_scaler_slot_s1 <= 3'd0;
+            scaler_sel_toggle_sync <= 3'b0;
             video_scaler_slot_vid <= 3'd0;
+            video_scaler_width_vid <= 10'd320;
+            video_scaler_height_vid <= 10'd240;
         end else begin
             vrr_toggle_sync <= {vrr_toggle_sync[1:0], vrr_toggle_cpu};
             if (vrr_toggle_sync[2] != vrr_toggle_sync[1])
                 vrr_vt_sync2 <= vrr_vt_hold;  // stable — toggle edge means new value ready
-            video_scaler_slot_s1 <= video_scaler_slot_cpu;
-            video_scaler_slot_vid <= video_scaler_slot_s1;
+            scaler_sel_toggle_sync <= {scaler_sel_toggle_sync[1:0], scaler_sel_toggle_cpu};
+            if (scaler_sel_toggle_sync[2] != scaler_sel_toggle_sync[1])
+                {video_scaler_slot_vid, video_scaler_width_vid, video_scaler_height_vid}
+                    <= scaler_sel_hold;  // stable: the toggle edge means a new value
         end
     end
 
@@ -2433,39 +2458,8 @@ assign video_hs = vidout_hs;
     localparam [9:0] CRT_V_CENTER_HEIGHT = 10'd240;
     localparam CRT_V_TOTAL_DEFAULT = 10'd525; // ~60.0 Hz at 24.576 MHz (old CRT_V_ACTIVE_BASE+240+CRT_V_FPORCH=262 was ~60 Hz at 12.288, = ~120 Hz at 24.576). Default sets frame LENGTH only; active region is crt_v_active_start/end.
 
-    function [9:0] scaler_slot_width;
-        input [2:0] slot;
-        begin
-            case (slot)
-                3'd0: scaler_slot_width = 10'd320;
-                3'd1: scaler_slot_width = 10'd320;
-                3'd2: scaler_slot_width = 10'd320;
-                3'd3: scaler_slot_width = 10'd320;
-                3'd4: scaler_slot_width = 10'd320;
-                3'd5: scaler_slot_width = 10'd400;
-                3'd6: scaler_slot_width = 10'd256;
-                3'd7: scaler_slot_width = 10'd640;   /* 640x480 (full-res) */
-                default: scaler_slot_width = 10'd320;
-            endcase
-        end
-    endfunction
-
-    function [9:0] scaler_slot_height;
-        input [2:0] slot;
-        begin
-            case (slot)
-                3'd0: scaler_slot_height = 10'd240;
-                3'd1: scaler_slot_height = 10'd200;
-                3'd2: scaler_slot_height = 10'd224;
-                3'd3: scaler_slot_height = 10'd256;
-                3'd4: scaler_slot_height = 10'd288;
-                3'd5: scaler_slot_height = 10'd300;
-                3'd6: scaler_slot_height = 10'd240;
-                3'd7: scaler_slot_height = 10'd480;   /* 640x480 (full-res); V_TOTAL floors to 18+480=498 -> ~31.6 Hz at the 12.288 MHz video clock */
-                default: scaler_slot_height = 10'd240;
-            endcase
-        end
-    endfunction
+    // Slot geometry comes from the periph's writable slot table
+    // (VIDEO_SCALER_MODE, reset = dist/core/video.json).
 
     // RGBHV Analogizer output mirrors the 640x480 carrier, so force the raw
     // CRT stream full-size only for RGBHV modes. Native 15 kHz modes use the
@@ -2475,10 +2469,10 @@ assign video_hs = vidout_hs;
         analogizer_full_raster_vid ? 3'd7 : video_scaler_slot_vid;
     wire [9:0] crt_h_active =
         analogizer_full_raster_vid ? 10'd640 :
-                                     scaler_slot_width(video_scaler_slot_vid);
+                                     video_scaler_width_vid;
     wire [9:0] crt_v_active =
         analogizer_full_raster_vid ? 10'd480 :
-                                     scaler_slot_height(video_scaler_slot_vid);
+                                     video_scaler_height_vid;
     wire [9:0] crt_v_center_offset =
         (crt_v_active < CRT_V_CENTER_HEIGHT) ?
         ((CRT_V_CENTER_HEIGHT - crt_v_active) >> 1) : 10'd0;
@@ -2669,6 +2663,8 @@ assign video_hs = vidout_hs;
     // are a direct echo of its include-list (Makefile VARIANT_DEFS).  Each
     // INCLUDE_* MUST match the gpu's same-named param below.
     axi_periph_slave #(
+        // Raster follows the writable scaler slot table (VIDEO_SCALER_MODE).
+        .SCALER_TABLE_WRITABLE(1),
         // CPU/RAM clock frequency advertisement (CLK_FREQ_HZ @ 0xD4) —
         // must track the mp_ram PLL selection above.  Firmware reads it at
         // boot (fallback: compile-time OF_TARGET_CPU_FREQ_HZ when 0), so
@@ -2810,6 +2806,8 @@ assign video_hs = vidout_hs;
         .analog_fb_height(analog_src_fb_height),
         .analog_fb_stride(analog_src_fb_stride),
         .video_scaler_slot(video_scaler_slot_cpu),
+        .video_scaler_width(video_scaler_width_cpu),
+        .video_scaler_height(video_scaler_height_cpu),
         // Palette write interface
         .pal_wr(cpu_pal_wr),
         .pal_addr(cpu_pal_addr),

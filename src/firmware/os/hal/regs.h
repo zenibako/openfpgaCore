@@ -125,7 +125,16 @@
  * supported mode fits the scanout line cache and 1 MB FB slot spacing. */
 #define FB_MODE_SIZE        REG32(SYSREG_BASE + 0xE4)
 #define FB_MODE_STRIDE      REG32(SYSREG_BASE + 0xE8)
+/* VIDEO_SCALER_MODE: a write with bit 31 = 0 selects slot [2:0].  A write
+ * with bit 31 = 1 sets slot [30:28]'s raster to width [27:18] x height [17:8]
+ * (slots 0 and 7 are fixed; hardware clamps to 16..640 x 16..600).  Reads
+ * return [31] = writable slot table, [29:20] height, [19:10] width of the
+ * selected slot, [2:0] slot.  Older bitstreams read [31] = 0. */
 #define VIDEO_SCALER_MODE   REG32(SYSREG_BASE + 0xEC)
+#define   VIDEO_SCALER_TABLE_WRITABLE  (1u << 31)
+#define   VIDEO_SCALER_PROGRAM(slot, w, h) \
+    (0x80000000u | (((uint32_t)(slot) & 7u) << 28) | \
+     (((uint32_t)(w) & 0x3ffu) << 18) | (((uint32_t)(h) & 0x3ffu) << 8))
 #define VIDEO_SCALER_SLOT_DEFAULT_320X240 0u
 
 /* Independent analog-output framebuffer geometry (Pocket LCD = Terminal: the

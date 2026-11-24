@@ -292,6 +292,9 @@ void services_table_init(void) {
     svc->savestate_finish = of_savestate_finish;
     svc->heap_can_reserve = syscall_heap_can_reserve;
     svc->savestate_set_id = of_savestate_set_id;
+
+    /* App-defined scaler slots */
+    svc->video_set_scaler_slots = of_video_set_scaler_slots;
 }
 
 void services_table_set_smp_bank(const void *base, uint32_t size) {
