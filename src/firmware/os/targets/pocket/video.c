@@ -59,6 +59,7 @@ static const of_video_mode_t video_modes[] = {
     {640, 360, 0, COLOR_MODE_8BIT, 0},
     {640, 400, 0, COLOR_MODE_8BIT, 0},
     {640, 480, 0, COLOR_MODE_8BIT, 0},
+    {640, 576, 0, COLOR_MODE_8BIT, 0},
     {800, 600, 0, COLOR_MODE_8BIT, 0},
 };
 
@@ -74,7 +75,7 @@ static const video_scaler_mode_t scaler_modes[] = {
     {320, 224, 2},
     {320, 256, 3},
     {320, 288, 4},
-    {400, 300, 5},
+    {640, 576, 5},   /* 10:9 full-res; the raster stretches to ~53 Hz (core_top.v) */
     {128, 128, 6},   /* 1:1; PICO-8-sized, LCD integer-scales to 11x (was 256x240) */
     {640, 480, 7},   /* 4:3; full-res slot 7 (core_top.v scaler_slot_*(7)) */
 };

@@ -65,6 +65,7 @@ static const of_video_mode_t g_video_modes[] = {
     {640, 360, 0, OF_VIDEO_MODE_8BIT, 0},
     {640, 400, 0, OF_VIDEO_MODE_8BIT, 0},
     {640, 480, 0, OF_VIDEO_MODE_8BIT, 0},
+    {640, 576, 0, OF_VIDEO_MODE_8BIT, 0},
     {800, 600, 0, OF_VIDEO_MODE_8BIT, 0},
 };
 
