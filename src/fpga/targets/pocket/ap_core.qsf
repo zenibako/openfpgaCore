@@ -903,6 +903,7 @@ set_global_assignment -name VERILOG_FILE ../../common/gpu_edge_walker.v
 set_global_assignment -name VERILOG_FILE ../../common/gpu_tex_cache.v
 set_global_assignment -name SYSTEMVERILOG_FILE ../../common/gpu_color_depth_cache.sv
 set_global_assignment -name VERILOG_FILE ../../common/axi_periph_slave.v
+set_global_assignment -name VERILOG_FILE ../../common/scaler_geom_cdc.v
 set_global_assignment -name VERILOG_FILE ../../common/sync_fifo.v
 set_global_assignment -name VERILOG_FILE snac_shifter.v
 # PSX SNAC: upstream Analogizer DualShock decoder (instantiated in axi_periph_slave.v)

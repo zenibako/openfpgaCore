@@ -110,6 +110,17 @@ typedef struct of_video_caps {
 } of_video_caps_t;
 #endif
 
+#ifndef OF_VIDEO_SCALER_SLOT_T_DEFINED
+#define OF_VIDEO_SCALER_SLOT_T_DEFINED
+/* One hardware scaler slot: the raster size the core emits for it.  An app's
+ * table must match the scaler_modes in its own core's video.json. */
+typedef struct of_video_scaler_slot {
+    uint16_t width;
+    uint16_t height;
+} of_video_scaler_slot_t;
+#define OF_VIDEO_SCALER_SLOTS 8
+#endif
+
 /* Framebuffer size per mode (320x240) */
 #define OF_FB_SIZE_8BIT     (320 * 240)         /* 76,800 bytes */
 #define OF_FB_SIZE_4BIT     (320 * 240 / 2)     /* 38,400 bytes */
@@ -322,6 +333,29 @@ static inline int of_video_check_mode(const of_video_mode_t *mode,
     return 0;
 }
 
+/* Declare the app's scaler slots so a framebuffer of exactly that size is
+ * scaled by the Pocket in hardware (integer-scaled under an LCD display mode)
+ * instead of falling back to slot 0.  slots[i] describes slot i; pass the same
+ * sizes, in the same order, as the scaler_modes in the app's video.json.
+ * Slot 0 must be 320x240 and slot 7 640x480 (boot/terminal and Analogizer
+ * use them).  Each call describes the whole table: entries past `count` go
+ * back to the default table, not to an earlier call's values.  Sizes are
+ * 16..640 wide and 16..600 tall.  A framebuffer uses a slot only when its
+ * size matches that slot exactly.
+ *
+ * Call once at startup, before of_video_set_mode().  The hardware applies a
+ * new slot or size at the next frame boundary, never mid-frame.
+ *
+ * Returns 0 on success, -1 when the runtime or bitstream has a fixed slot
+ * table (keep the app's fallback path), -2 for an invalid table. */
+static inline int of_video_set_scaler_slots(const of_video_scaler_slot_t *slots,
+                                            uint32_t count) {
+    if (OF_SVC->count > OF_VIDEO_SVC_INDEX(video_set_scaler_slots) &&
+        OF_SVC->video_set_scaler_slots)
+        return OF_SVC->video_set_scaler_slots(slots, count);
+    return -1;
+}
+
 /* Register a callback invoked on every vsync (vblank) IRQ.
  * Pass NULL to disable. Callback runs in kernel context — keep it short. */
 static inline void of_video_set_vsync_callback(void (*cb)(void)) {
@@ -396,6 +430,8 @@ int      of_video_get_mode_info(int index, of_video_mode_t *out);
 void     of_video_get_caps(of_video_caps_t *out);
 int      of_video_check_mode(const of_video_mode_t *mode,
                              of_video_mode_t *normalized);
+int      of_video_set_scaler_slots(const of_video_scaler_slot_t *slots,
+                                   uint32_t count);
 void     of_video_get_timing(of_video_timing_t *out);
 uint64_t of_video_last_vblank_us(void);
 uint64_t of_video_last_flip_presented_us(void);

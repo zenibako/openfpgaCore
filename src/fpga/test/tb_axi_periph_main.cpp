@@ -1071,6 +1071,67 @@ static void test_video_vtotal_sysreg() {
     tb->analogizer_settings_in = 0x00008C43u;
 }
 
+static void test_scaler_slot_table() {
+    printf("test_scaler_slot_table:\n");
+
+    const uint32_t VIDEO_SCALER_MODE = 0x400000ECu;
+    // Readback: [31] writable table, [29:20] height, [19:10] width, [2:0] slot.
+    auto sel = [](uint32_t v) { return v & 7u; };
+    auto w = [](uint32_t v) { return (v >> 10) & 0x3ffu; };
+    auto h = [](uint32_t v) { return (v >> 20) & 0x3ffu; };
+    auto prog = [](uint32_t slot, uint32_t width, uint32_t height) {
+        return 0x80000000u | (slot << 28) | (width << 18) | (height << 8);
+    };
+
+    uint32_t v = mmio_read32(VIDEO_SCALER_MODE);
+    check_eq("scaler-writable-flag", v >> 31, 1u);
+    check_eq("scaler-reset-slot", sel(v), 0u);
+    check_eq("scaler-reset-slot0-w", w(v), 320u);
+    check_eq("scaler-reset-slot0-h", h(v), 240u);
+
+    // A legacy select still works and reports the default table.
+    axi_write_single(VIDEO_SCALER_MODE, 6u);
+    v = mmio_read32(VIDEO_SCALER_MODE);
+    check_eq("scaler-legacy-select", sel(v), 6u);
+    check_eq("scaler-default-slot6-w", w(v), 256u);
+    check_eq("scaler-default-slot6-h", h(v), 240u);
+
+    // Programming a slot does not change the selection.
+    axi_write_single(VIDEO_SCALER_MODE, prog(6u, 128u, 128u));
+    v = mmio_read32(VIDEO_SCALER_MODE);
+    check_eq("scaler-program-keeps-select", sel(v), 6u);
+    check_eq("scaler-program-slot6-w", w(v), 128u);
+    check_eq("scaler-program-slot6-h", h(v), 128u);
+
+    // Clamps: width <= 640, height <= 600, both >= 16.
+    axi_write_single(VIDEO_SCALER_MODE, prog(5u, 1023u, 1023u));
+    axi_write_single(VIDEO_SCALER_MODE, 5u);
+    v = mmio_read32(VIDEO_SCALER_MODE);
+    check_eq("scaler-clamp-high-w", w(v), 640u);
+    check_eq("scaler-clamp-high-h", h(v), 600u);
+    axi_write_single(VIDEO_SCALER_MODE, prog(5u, 1u, 1u));
+    v = mmio_read32(VIDEO_SCALER_MODE);
+    check_eq("scaler-clamp-low-w", w(v), 16u);
+    check_eq("scaler-clamp-low-h", h(v), 16u);
+
+    // Slots 0 (boot/terminal) and 7 (Analogizer RGBHV) are fixed.
+    axi_write_single(VIDEO_SCALER_MODE, prog(0u, 128u, 128u));
+    axi_write_single(VIDEO_SCALER_MODE, prog(7u, 128u, 128u));
+    axi_write_single(VIDEO_SCALER_MODE, 0u);
+    v = mmio_read32(VIDEO_SCALER_MODE);
+    check_eq("scaler-slot0-fixed-w", w(v), 320u);
+    check_eq("scaler-slot0-fixed-h", h(v), 240u);
+    axi_write_single(VIDEO_SCALER_MODE, 7u);
+    v = mmio_read32(VIDEO_SCALER_MODE);
+    check_eq("scaler-slot7-fixed-w", w(v), 640u);
+    check_eq("scaler-slot7-fixed-h", h(v), 480u);
+
+    // Restore the defaults touched above so later tests see reset state.
+    axi_write_single(VIDEO_SCALER_MODE, prog(5u, 400u, 300u));
+    axi_write_single(VIDEO_SCALER_MODE, prog(6u, 256u, 240u));
+    axi_write_single(VIDEO_SCALER_MODE, 0u);
+}
+
 static void test_fb_mode_sysregs() {
     printf("test_fb_mode_sysregs:\n");
 
@@ -1650,6 +1711,7 @@ int main(int argc, char **argv) {
     test_palette_commit_sysreg();
     test_analogizer_sysregs();
     test_video_vtotal_sysreg();
+    test_scaler_slot_table();
     test_fb_mode_sysregs();
     test_analog_fb_source_mux();
     test_hw_features_readback();

@@ -373,6 +373,14 @@ void of_video_get_caps(of_video_caps_t *out) {
     __of_video_default_caps(out);
 }
 
+/* The desktop window scales any framebuffer size, so there is no slot table. */
+int of_video_set_scaler_slots(const of_video_scaler_slot_t *slots,
+                              uint32_t count) {
+    (void)slots;
+    (void)count;
+    return -1;
+}
+
 int of_video_check_mode(const of_video_mode_t *mode,
                         of_video_mode_t *normalized) {
     return normalize_mode(mode, normalized, NULL);

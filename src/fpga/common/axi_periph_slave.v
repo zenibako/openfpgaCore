@@ -27,6 +27,10 @@ module axi_periph_slave #(
     parameter CLK_HZ             = 32'd100_000_000,
     // Pocket freezes presentation for its system menu; MiSTer's OSD is an overlay.
     parameter FREEZE_VIDEO_IN_MENU = 1,
+    // 1 when the target's raster follows video_scaler_width/height (Pocket
+    // core_top).  Advertised in VIDEO_SCALER_MODE bit 31 so os.bin only
+    // programs the slot table where it takes effect; MiSTer keeps 0.
+    parameter SCALER_TABLE_WRITABLE = 0,
     // Hardware feature advertisement (HW_FEATURES register @ 0x98).
     // Per-feature switches so the shared capability bits live in exactly
     // one place (HW_FEATURES_RESOLVED below); a target without a given
@@ -233,6 +237,11 @@ module axi_periph_slave #(
     output wire [9:0]  analog_fb_height,
     output wire [15:0] analog_fb_stride,
     output wire [2:0]  video_scaler_slot,
+    // Raster geometry of the selected scaler slot.  The slot table is
+    // writable through VIDEO_SCALER_MODE (bit 31 = 1, see below) so each app
+    // can declare its own 8 sizes; it resets to the shared default table.
+    output wire [9:0]  video_scaler_width,
+    output wire [9:0]  video_scaler_height,
 
     // Palette write interface
     output reg         pal_wr,
@@ -733,6 +742,58 @@ reg [9:0]  analog_fb_width_reg;
 reg [9:0]  analog_fb_height_reg;
 reg [15:0] analog_fb_stride_reg;
 reg [2:0] video_scaler_slot_reg;
+reg [9:0] scaler_slot_w [0:7];
+integer   scaler_slot_i;
+reg [9:0] scaler_slot_h [0:7];
+
+// Default slot table (dist/core/video.json).  Slot 0 is the boot/terminal
+// 320x240 mode; slot 7 is the 640x480 Analogizer RGBHV carrier.
+function [9:0] default_slot_width;
+    input [2:0] slot;
+    begin
+        case (slot)
+            3'd5: default_slot_width = 10'd400;
+            3'd6: default_slot_width = 10'd256;
+            3'd7: default_slot_width = 10'd640;
+            default: default_slot_width = 10'd320;
+        endcase
+    end
+endfunction
+
+function [9:0] default_slot_height;
+    input [2:0] slot;
+    begin
+        case (slot)
+            3'd1: default_slot_height = 10'd200;
+            3'd2: default_slot_height = 10'd224;
+            3'd3: default_slot_height = 10'd256;
+            3'd4: default_slot_height = 10'd288;
+            3'd5: default_slot_height = 10'd300;
+            3'd7: default_slot_height = 10'd480;
+            default: default_slot_height = 10'd240;
+        endcase
+    end
+endfunction
+
+// The raster has 640 active clocks per line (CRT_H_TOTAL is fixed) and the
+// Pocket scaler only locks down to ~47 Hz, which bounds the active height.
+function [9:0] clamp_slot_width;
+    input [9:0] w;
+    begin
+        if (w < 10'd16)       clamp_slot_width = 10'd16;
+        else if (w > 10'd640) clamp_slot_width = 10'd640;
+        else                  clamp_slot_width = w;
+    end
+endfunction
+
+function [9:0] clamp_slot_height;
+    input [9:0] h;
+    begin
+        if (h < 10'd16)       clamp_slot_height = 10'd16;
+        else if (h > 10'd600) clamp_slot_height = 10'd600;
+        else                  clamp_slot_height = h;
+    end
+endfunction
 
 reg [15:0] ds_slot_id_reg;
 reg [31:0] ds_slot_offset_reg;
@@ -982,6 +1043,8 @@ assign analog_fb_width   = analog_show_term ? fb_width_reg : analog_fb_width_reg
 assign analog_fb_height  = analog_show_term ? fb_height_reg : analog_fb_height_reg;
 assign analog_fb_stride  = analog_show_term ? fb_stride_reg : analog_fb_stride_reg;
 assign video_scaler_slot = video_scaler_slot_reg;
+assign video_scaler_width  = scaler_slot_w[video_scaler_slot_reg];
+assign video_scaler_height = scaler_slot_h[video_scaler_slot_reg];
 
 // ============================================
 // CDC synchronizers
@@ -1351,6 +1414,10 @@ always @(posedge clk) begin
         analog_fb_height_reg <= 10'd240;
         analog_fb_stride_reg <= 16'd320;
         video_scaler_slot_reg <= 3'd0;
+        for (scaler_slot_i = 0; scaler_slot_i < 8; scaler_slot_i = scaler_slot_i + 1) begin
+            scaler_slot_w[scaler_slot_i] <= default_slot_width(scaler_slot_i[2:0]);
+            scaler_slot_h[scaler_slot_i] <= default_slot_height(scaler_slot_i[2:0]);
+        end
         fb_display_idx <= 2'd0;
         fb_ready_idx <= 2'd0;
         fb_swap_pending <= 1'b0;
@@ -1628,7 +1695,20 @@ always @(posedge clk) begin
                     fb_height_reg <= clamp_fb_height(req_wdata[31:16]);
                 end
                 6'd58: fb_stride_reg <= clamp_fb_stride(req_wdata[15:0]); // FB_MODE_STRIDE (0xE8)
-                6'd59: video_scaler_slot_reg <= req_wdata[2:0];   // VIDEO_SCALER_MODE (0xEC)
+                6'd59: begin                                      // VIDEO_SCALER_MODE (0xEC)
+                    // bit 31 = 0: select slot [2:0] (unchanged behavior).
+                    // bit 31 = 1: program slot [30:28] with width [27:18]
+                    // and height [17:8].  Slot 0 stays 320x240 (boot and
+                    // terminal) and slot 7 stays 640x480 (Analogizer RGBHV
+                    // forces it), so writes to them are ignored.
+                    if (!req_wdata[31])
+                        video_scaler_slot_reg <= req_wdata[2:0];
+                    else if (req_wdata[30:28] != 3'd0 &&
+                             req_wdata[30:28] != 3'd7) begin
+                        scaler_slot_w[req_wdata[30:28]] <= clamp_slot_width(req_wdata[27:18]);
+                        scaler_slot_h[req_wdata[30:28]] <= clamp_slot_height(req_wdata[17:8]);
+                    end
+                end
                 6'd60: begin                                      // ANALOG_FB_SIZE (0xF0)
                     analog_fb_width_reg  <= clamp_fb_width(req_wdata[15:0]);
                     analog_fb_height_reg <= clamp_fb_height(req_wdata[31:16]);
@@ -1912,8 +1992,10 @@ always @(*) begin
 `ifndef EXCLUDE_SYSREG_DIAG_READBACK
             6'd57: sysreg_rdata = {6'b0, fb_height_reg, 6'b0, fb_width_reg};
             6'd58: sysreg_rdata = {16'b0, fb_stride_reg};
-            6'd59: sysreg_rdata = {29'b0, video_scaler_slot_reg};
 `endif
+            // Always readable: bit 31 advertises the writable slot table so
+            // os.bin can detect it without a HW_FEATURES bit.
+            6'd59: sysreg_rdata = {(SCALER_TABLE_WRITABLE != 0), 1'b0, video_scaler_height, video_scaler_width, 7'b0, video_scaler_slot_reg};
             6'd63: sysreg_rdata = {26'b0, irq_mask};
             default: ;
         endcase
