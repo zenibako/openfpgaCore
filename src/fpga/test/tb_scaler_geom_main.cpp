@@ -80,10 +80,27 @@ static void check_frame(const char *name, const Frame &f, unsigned w, unsigned h
     check(buf, presented.count(f.word) == 1);
 }
 
+// A frame before the new geometry lands must still be one whole, untorn
+// frame on some geometry the CPU side presented.
+static void check_transitional(const char *name, int i, const Frame &f) {
+    char buf[96];
+    snprintf(buf, sizeof buf, "%s-frame%d-no-mid-frame-change", name, i);
+    check(buf, !f.mixed);
+    snprintf(buf, sizeof buf, "%s-frame%d-not-torn", name, i);
+    check(buf, presented.count(f.word) == 1);
+    bool known = false;
+    for (uint32_t p : presented)
+        if (f.lines == (p & 0x3ff) && f.pixels == ((p >> 10) & 0x3ff)) known = true;
+    snprintf(buf, sizeof buf, "%s-frame%d-known-geometry", name, i);
+    check(buf, known, f.lines, -1);
+}
+
 // After a change, the new geometry must be in place within two frames.
 static Frame settle(const char *name, unsigned w, unsigned h) {
     Frame f = next_frame();
+    check_transitional(name, 0, f);
     f = next_frame();
+    check_transitional(name, 1, f);
     f = next_frame();   // first full frame entirely on the new geometry
     check_frame(name, f, w, h);
     return f;
